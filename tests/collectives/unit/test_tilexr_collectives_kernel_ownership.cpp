@@ -153,6 +153,7 @@ void TestCollectivesOwnsCceBuild()
     CheckContains(kernelsCmakePath, kernelsCmake, "OBJECT_DEPENDS");
     CheckContains(kernelsCmakePath, kernelsCmake, "tilexr_collectives_op.o");
     CheckContains(kernelsCmakePath, kernelsCmake, "tilexr_collectives_op");
+    CheckContains(kernelsCmakePath, kernelsCmake, "$<TARGET_OBJECTS:tilexr_collectives_op_tmp>");
     CheckContains(kernelsCmakePath, kernelsCmake, "TILEXR_COLLECTIVES_ENABLE_PROFILING");
     CheckContains(kernelsCmakePath, kernelsCmake, "TILEXR_COLLECTIVES_1OP_BIN_SIZE 10485760");
     CheckDoesNotContain(kernelsCmakePath, kernelsCmake, "src/comm");

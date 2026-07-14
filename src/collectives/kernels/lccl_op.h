@@ -14,6 +14,9 @@
 
 #include "op_def.h"
 #include "allgather.h"
+
+#include "allgather_naive.h" // My
+
 #include "91093/allgather_hierarchy_double_ring.h"
 #include "allreduce_quant.h"
 #include "allreduce_one_shot.h"
@@ -115,7 +118,9 @@ extern "C" __global__ __aicore__ void TileXRAllGather_##type##suffix(KERNELS_ARG
     constexpr int32_t smallDataSize910a3 = 32 * 1024 * 1024; \
     __gm__ type * shareAddrs[TILEXR_MAX_RANK_SIZE]; \
     GET_IPC_MEM_ARGS(type); \
-    if ((extraFlag & ExtraFlag::TOPO_910B2C) != 0 && rankSize > smallRankSize) { \
+    if constexpr(TILEXR_COLLECTIVES_USE_NAIVE_ALLGATHER && std::is_same_v<type,int>){\
+    CLASS_OP_LAUNCH(AllGatherNaive,type); \
+    }else if ((extraFlag & ExtraFlag::TOPO_910B2C) != 0 && rankSize > smallRankSize) { \
         if (len * sizeof(type) < cceSmallDataSize) { \
             TileXRAllGather910B2C<type>(ALLREDUCE_ARGS_CALL_16P(type)); \
         } else { \

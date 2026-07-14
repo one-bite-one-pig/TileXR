@@ -8,6 +8,7 @@ enable_language(CCE)
 
 set(TILEXR_COLLECTIVES_1OP_BIN_SIZE 10485760 CACHE STRING "Padded size for TileXR collectives CCE binary")
 option(TILEXR_COLLECTIVES_ENABLE_PROFILING "Enable TileXR collectives kernel profiling helpers" OFF)
+option(TILEXR_COLLECTIVES_USE_NAIVE_ALLGATHER "Use my AllGather" OFF)
 set(_tilexr_collectives_default_soc_type "$ENV{TILEXR_COLLECTIVES_SOC_TYPE}")
 if(NOT _tilexr_collectives_default_soc_type)
     set(_tilexr_collectives_default_soc_type "$ENV{TILEXR_SOC_NAME}")
@@ -64,6 +65,19 @@ include_directories(
 add_library(tilexr_collectives_op_tmp OBJECT
         tilexr_lccl_op.cpp
 )
+if (TILEXR_COLLECTIVES_USE_NAIVE_ALLGATHER)
+    target_compile_definitions(
+        tilexr_collectives_op_tmp
+        PRIVATE
+        TILEXR_COLLECTIVES_USE_NAIVE_ALLGATHER=1
+    )
+else()
+    target_compile_definitions(
+        tilexr_collectives_op_tmp
+        PRIVATE
+        TILEXR_COLLECTIVES_USE_NAIVE_ALLGATHER=0
+    )
+endif()
 
 target_compile_options(tilexr_collectives_op_tmp PRIVATE
         ${CCE_COMPILE_OPTION}
@@ -78,10 +92,13 @@ set(TILEXR_COLLECTIVES_OP "${CMAKE_CURRENT_BINARY_DIR}/tilexr_collectives_op.o")
 add_custom_command(
         OUTPUT "${TILEXR_COLLECTIVES_OP}"
         COMMAND ${CMAKE_CCE_LINKER} -m aicorelinux -Ttext=0
-                "CMakeFiles/tilexr_collectives_op_tmp.dir/tilexr_lccl_op.cpp.o"
+                $<TARGET_OBJECTS:tilexr_collectives_op_tmp>
                 --static -o "${TILEXR_COLLECTIVES_OP}" --allow-multiple-definition
         COMMAND truncate -c -s ${TILEXR_COLLECTIVES_1OP_BIN_SIZE} "${TILEXR_COLLECTIVES_OP}"
-        DEPENDS tilexr_collectives_op_tmp
+        DEPENDS
+                tilexr_collectives_op_tmp
+                $<TARGET_OBJECTS:tilexr_collectives_op_tmp>
+        COMMAND_EXPAND_LISTS
         VERBATIM
 )
 

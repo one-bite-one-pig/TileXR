@@ -1,0 +1,1558 @@
+/*
+ * Copyright (c) 2024-2026 TileXR Project
+ * This file is a part of the CANN Open Software.
+ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+#include <algorithm>
+#include <cerrno>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include "acl/acl.h"
+#include "local_launcher.h"
+#include "tilexr_collectives.h"
+#include "tilexr_collectives_perf.h"
+#include "tilexr/collectives_perf/int32_pattern.h"
+
+namespace {
+
+constexpr int64_t kMaxHostBufferBytes = 1LL << 30;
+
+enum class CollectiveOp {
+    ALLGATHER,
+    ALLTOALL,
+    ALLREDUCE,
+    REDUCESCATTER,
+    BROADCAST,
+    NOOP,
+    PROFILE_PROBE,
+};
+
+enum class CommMode {
+    LOCAL,
+    SOCKET,
+};
+
+struct DataTypeInfo {
+    TileXR::TileXRDataType type = TileXR::TILEXR_DATA_TYPE_INT32;
+    std::string name = "int32";
+    size_t bytes = sizeof(int32_t);
+};
+
+struct Options {
+    CollectiveOp op = CollectiveOp::ALLGATHER;
+    int64_t minBytes = 4;
+    int64_t maxBytes = 4096;
+    double stepFactor = 2.0;
+    int iters = 20;
+    int warmupIters = 5;
+    DataTypeInfo dtype;
+    int rankSize = 2;
+    int rank = 0;
+    bool rankSpecified = false;
+    bool worker = false;
+    int firstNpu = 0;
+    int deviceIdOverride = -1;
+    int timeoutSec = 600;
+    std::string logDir = ".";
+    CommMode commMode = CommMode::LOCAL;
+    bool check = true;
+    std::string csvPath;
+    double minAlgBw = -1.0;
+    double maxLatencyUs = -1.0;
+    bool profile = false;
+    std::string profileDir;
+    bool profileAiPrompt = false;
+    int profileSampleEvery = 1;
+};
+
+struct Measurement {
+    double avgUs = 0.0;
+    double minUs = 0.0;
+    double maxUs = 0.0;
+};
+
+struct Row {
+    std::string op;
+    std::string dtype;
+    int ranks = 0;
+    int64_t bytes = 0;
+    int64_t count = 0;
+    int iters = 0;
+    double algBw = 0.0;
+    double busBw = 0.0;
+    double avgUs = 0.0;
+    double minUs = 0.0;
+    double maxUs = 0.0;
+    int errors = 0;
+};
+
+std::string JoinPath(const std::string &base, const std::string &leaf);
+bool CreateDirectories(const std::string &path);
+bool WriteProfileHostInfo(const Options &options);
+std::string ResolveProfileOutputDir(const Options &options, uint64_t profileLaunchIndex);
+bool ProfileThisLaunch(const Options &options, uint64_t profileLaunchIndex);
+bool StartPerfSessionForLaunch(const Options &options, uint64_t profileLaunchIndex,
+                               TileXRCollectivePerfSession &perfSession);
+void FinishPerfSession(TileXRCollectivePerfSession &perfSession, const Options &options, aclrtStream stream,
+                       int &totalErrors, bool skipWriteReport, const std::string &skipReason);
+
+using TileXRCollectivesTest::CanUseCollisionFreeInt32Pattern;
+using TileXRCollectivesTest::ExpectedAllGatherValue;
+using TileXRCollectivesTest::ExpectedAllToAllValue;
+
+bool IsReductionOp(CollectiveOp op)
+{
+    return op == CollectiveOp::ALLREDUCE || op == CollectiveOp::REDUCESCATTER;
+}
+
+std::string OpName(CollectiveOp op)
+{
+    switch (op) {
+        case CollectiveOp::ALLGATHER:
+            return "allgather";
+        case CollectiveOp::ALLTOALL:
+            return "alltoall";
+        case CollectiveOp::ALLREDUCE:
+            return "allreduce";
+        case CollectiveOp::REDUCESCATTER:
+            return "reducescatter";
+        case CollectiveOp::BROADCAST:
+            return "broadcast";
+        case CollectiveOp::NOOP:
+            return "noop";
+        case CollectiveOp::PROFILE_PROBE:
+            return "profile-probe";
+    }
+    return "unknown";
+}
+
+std::string CommModeName(CommMode mode)
+{
+    switch (mode) {
+        case CommMode::LOCAL:
+            return "local";
+        case CommMode::SOCKET:
+            return "socket";
+    }
+    return "unknown";
+}
+
+int32_t ExpectedAllReduceSum(int rankSize, int64_t index)
+{
+    int64_t sum = 0;
+    for (int rank = 0; rank < rankSize; ++rank) {
+        sum += ExpectedAllGatherValue(rankSize, rank, index);
+    }
+    return static_cast<int32_t>(sum);
+}
+
+int32_t ExpectedReduceScatterSum(int rankSize, int rank, int64_t recvCount, int64_t index)
+{
+    const int64_t globalIndex = static_cast<int64_t>(rank) * recvCount + index;
+    int64_t sum = 0;
+    for (int srcRank = 0; srcRank < rankSize; ++srcRank) {
+        sum += ExpectedAllGatherValue(rankSize, srcRank, globalIndex);
+    }
+    return static_cast<int32_t>(sum);
+}
+
+uint8_t PatternByte(int rank, int peer, int64_t byteIndex)
+{
+    return static_cast<uint8_t>((rank * 37 + peer * 13 + byteIndex) & 0xff);
+}
+
+void StoreInt32(std::vector<uint8_t> &buffer, int64_t index, int32_t value)
+{
+    std::memcpy(buffer.data() + static_cast<size_t>(index) * sizeof(int32_t), &value, sizeof(value));
+}
+
+int32_t LoadInt32(const std::vector<uint8_t> &buffer, int64_t index)
+{
+    int32_t value = 0;
+    std::memcpy(&value, buffer.data() + static_cast<size_t>(index) * sizeof(int32_t), sizeof(value));
+    return value;
+}
+
+void PrintUsage(const char *program)
+{
+    std::cerr
+        << "Usage: " << program << " [options]\n"
+        << "  --op allgather|alltoall|allreduce|reducescatter|broadcast|profile-probe\n"
+        << "  Message-size semantics: allgather/allreduce/broadcast: count * dtype_size; "
+           "alltoall/reducescatter: count * rank_size * dtype_size\n"
+        << "  --min-bytes N --max-bytes N --step-factor F\n"
+        << "  --iters N --warmup-iters N\n"
+        << "  --datatype int8|int16|int32|int64|fp16|fp32|bf16\n"
+        << "  --rank-size N --first-npu D\n"
+        << "  [--timeout-sec N] [--log-dir path]\n"
+        << "  [--worker --rank R] [--device-id D] [--comm-mode local|socket]\n"
+        << "  --check 0|1 [--csv path]\n"
+        << "  [--min-algbw GB/s] [--max-latency-us us]\n"
+        << "  [--profile 0|1] [--profile-dir path]\n"
+        << "  [--profile-ai-prompt 0|1] [--profile-sample-every N]\n";
+}
+
+bool ParseBool(const std::string &value, bool &out)
+{
+    if (value == "1" || value == "true" || value == "yes") {
+        out = true;
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "no") {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+bool ParseDataType(const std::string &value, DataTypeInfo &info)
+{
+    if (value == "int8") {
+        info = DataTypeInfo{TileXR::TILEXR_DATA_TYPE_INT8, "int8", 1};
+    } else if (value == "int16") {
+        info = DataTypeInfo{TileXR::TILEXR_DATA_TYPE_INT16, "int16", 2};
+    } else if (value == "int32") {
+        info = DataTypeInfo{TileXR::TILEXR_DATA_TYPE_INT32, "int32", 4};
+    } else if (value == "int64") {
+        info = DataTypeInfo{TileXR::TILEXR_DATA_TYPE_INT64, "int64", 8};
+    } else if (value == "fp16") {
+        info = DataTypeInfo{TileXR::TILEXR_DATA_TYPE_FP16, "fp16", 2};
+    } else if (value == "fp32") {
+        info = DataTypeInfo{TileXR::TILEXR_DATA_TYPE_FP32, "fp32", 4};
+    } else if (value == "bf16" || value == "bfp16") {
+        info = DataTypeInfo{TileXR::TILEXR_DATA_TYPE_BFP16, "bf16", 2};
+    } else {
+        return false;
+    }
+    return true;
+}
+
+bool ParseCommMode(const std::string &value, CommMode &mode)
+{
+    if (value == "local") {
+        mode = CommMode::LOCAL;
+        return true;
+    }
+    if (value == "socket") {
+        mode = CommMode::SOCKET;
+        return true;
+    }
+    return false;
+}
+
+bool ParseInt64(const std::string &text, int64_t &out)
+{
+    char *end = nullptr;
+    errno = 0;
+    const long long value = std::strtoll(text.c_str(), &end, 10);
+    if (errno == ERANGE || end == text.c_str() || *end != '\0') {
+        return false;
+    }
+    out = static_cast<int64_t>(value);
+    return true;
+}
+
+bool ParseInt(const std::string &text, int &out)
+{
+    int64_t value = 0;
+    if (!ParseInt64(text, value) || value < std::numeric_limits<int>::min() ||
+        value > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    out = static_cast<int>(value);
+    return true;
+}
+
+bool ParseDouble(const std::string &text, double &out)
+{
+    char *end = nullptr;
+    errno = 0;
+    const double value = std::strtod(text.c_str(), &end);
+    if (errno == ERANGE || end == text.c_str() || *end != '\0' || !std::isfinite(value)) {
+        return false;
+    }
+    out = value;
+    return true;
+}
+
+bool CheckedMulInt64(int64_t lhs, int64_t rhs, int64_t &out)
+{
+    if (lhs < 0 || rhs < 0) {
+        return false;
+    }
+    if (lhs != 0 && rhs > std::numeric_limits<int64_t>::max() / lhs) {
+        return false;
+    }
+    out = lhs * rhs;
+    return true;
+}
+
+bool CheckedBytesForElements(int64_t elements, size_t elementBytes, int64_t &bytes)
+{
+    if (elementBytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        return false;
+    }
+    return CheckedMulInt64(elements, static_cast<int64_t>(elementBytes), bytes) &&
+        static_cast<uint64_t>(bytes) <= static_cast<uint64_t>(std::numeric_limits<size_t>::max());
+}
+
+bool FitsHostBufferLimit(int64_t bytes)
+{
+    return bytes > 0 && bytes <= kMaxHostBufferBytes;
+}
+
+bool ComputeMessageSizes(const Options &options, int64_t count, int64_t &sendElements, int64_t &recvElements,
+                         int64_t &sendBytes, int64_t &recvBytes)
+{
+    if (count <= 0) {
+        return false;
+    }
+    const int64_t rankSize = static_cast<int64_t>(options.rankSize);
+    sendElements = count;
+    recvElements = count;
+    switch (options.op) {
+        case CollectiveOp::ALLGATHER:
+            if (!CheckedMulInt64(count, rankSize, recvElements)) {
+                return false;
+            }
+            break;
+        case CollectiveOp::ALLTOALL:
+            if (!CheckedMulInt64(count, rankSize, sendElements) ||
+                !CheckedMulInt64(count, rankSize, recvElements)) {
+                return false;
+            }
+            break;
+        case CollectiveOp::ALLREDUCE:
+            break;
+        case CollectiveOp::REDUCESCATTER:
+            if (!CheckedMulInt64(count, rankSize, sendElements)) {
+                return false;
+            }
+            break;
+        case CollectiveOp::BROADCAST:
+            break;
+        case CollectiveOp::NOOP:
+            break;
+        case CollectiveOp::PROFILE_PROBE:
+            break;
+    }
+    return CheckedBytesForElements(sendElements, options.dtype.bytes, sendBytes) &&
+        CheckedBytesForElements(recvElements, options.dtype.bytes, recvBytes) &&
+        FitsHostBufferLimit(sendBytes) && FitsHostBufferLimit(recvBytes);
+}
+
+int64_t MessageSizeDivisor(const Options &options)
+{
+    const int64_t divisor = (options.op == CollectiveOp::ALLTOALL ||
+                             options.op == CollectiveOp::REDUCESCATTER) ?
+        static_cast<int64_t>(options.rankSize) * static_cast<int64_t>(options.dtype.bytes) :
+        static_cast<int64_t>(options.dtype.bytes);
+    return divisor;
+}
+
+bool ValidateMaxMessageSize(const Options &options)
+{
+    int64_t count = options.maxBytes / MessageSizeDivisor(options);
+    if (count <= 0) {
+        count = 1;
+    }
+    int64_t validationCount = count;
+    if (options.op == CollectiveOp::REDUCESCATTER &&
+        !CheckedMulInt64(count, static_cast<int64_t>(options.rankSize), validationCount)) {
+        std::cerr << "ERROR: message size too large" << std::endl;
+        return false;
+    }
+    if (options.check && options.dtype.name == "int32" &&
+        options.op != CollectiveOp::NOOP && options.op != CollectiveOp::PROFILE_PROBE &&
+        !CanUseCollisionFreeInt32Pattern(options.rankSize, validationCount)) {
+        std::cerr << "ERROR: message size is too large for collision-free INT32 validation" << std::endl;
+        return false;
+    }
+    int64_t sendElements = 0;
+    int64_t recvElements = 0;
+    int64_t sendBytes = 0;
+    int64_t recvBytes = 0;
+    if (!ComputeMessageSizes(options, count, sendElements, recvElements, sendBytes, recvBytes)) {
+        std::cerr << "ERROR: message size too large" << std::endl;
+        return false;
+    }
+    (void)sendElements;
+    (void)recvElements;
+    (void)sendBytes;
+    (void)recvBytes;
+    return true;
+}
+
+bool AdvanceBytes(int64_t current, double factor, int64_t maxBytes, int64_t &next)
+{
+    const double scaled = static_cast<double>(current) * factor;
+    if (!std::isfinite(scaled) || scaled > static_cast<double>(std::numeric_limits<int64_t>::max())) {
+        return false;
+    }
+    const int64_t candidate = static_cast<int64_t>(scaled);
+    if (candidate <= current) {
+        if (current == std::numeric_limits<int64_t>::max()) {
+            return false;
+        }
+        next = current + 1;
+    } else {
+        next = candidate;
+    }
+    if (next < current) {
+        return false;
+    }
+    if (next > maxBytes) {
+        next = maxBytes;
+    }
+    return true;
+}
+
+bool ParseOptions(int argc, char **argv, Options &options)
+{
+    const char *timeoutEnv = std::getenv("TILEXR_COLLECTIVES_RUN_TIMEOUT_SEC");
+    if (timeoutEnv != nullptr && timeoutEnv[0] != '\0') {
+        if (!ParseInt(timeoutEnv, options.timeoutSec) || options.timeoutSec <= 0) {
+            std::cerr << "ERROR: TILEXR_COLLECTIVES_RUN_TIMEOUT_SEC must be a positive integer" << std::endl;
+            return false;
+        }
+    }
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        auto requireValue = [&](const std::string &name) -> const char * {
+            if (i + 1 >= argc) {
+                std::cerr << "ERROR: missing value for " << name << std::endl;
+                return nullptr;
+            }
+            return argv[++i];
+        };
+
+        if (arg == "--op") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            const std::string op(value);
+            if (op == "allgather") {
+                options.op = CollectiveOp::ALLGATHER;
+            } else if (op == "alltoall") {
+                options.op = CollectiveOp::ALLTOALL;
+            } else if (op == "allreduce") {
+                options.op = CollectiveOp::ALLREDUCE;
+            } else if (op == "reducescatter") {
+                options.op = CollectiveOp::REDUCESCATTER;
+            } else if (op == "broadcast") {
+                options.op = CollectiveOp::BROADCAST;
+            } else if (op == "noop") {
+                options.op = CollectiveOp::NOOP;
+            } else if (op == "profile-probe") {
+                options.op = CollectiveOp::PROFILE_PROBE;
+            } else {
+                std::cerr
+                    << "ERROR: --op must be allgather, alltoall, allreduce, reducescatter, broadcast, or profile-probe"
+                    << std::endl;
+                return false;
+            }
+        } else if (arg == "--min-bytes") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            if (!ParseInt64(value, options.minBytes)) {
+                std::cerr << "ERROR: invalid --min-bytes" << std::endl;
+                return false;
+            }
+        } else if (arg == "--max-bytes") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            if (!ParseInt64(value, options.maxBytes)) {
+                std::cerr << "ERROR: invalid --max-bytes" << std::endl;
+                return false;
+            }
+        } else if (arg == "--step-factor") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            if (!ParseDouble(value, options.stepFactor)) {
+                std::cerr << "ERROR: invalid --step-factor" << std::endl;
+                return false;
+            }
+        } else if (arg == "--iters") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            if (!ParseInt(value, options.iters)) {
+                std::cerr << "ERROR: invalid --iters" << std::endl;
+                return false;
+            }
+        } else if (arg == "--warmup-iters") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            if (!ParseInt(value, options.warmupIters)) {
+                std::cerr << "ERROR: invalid --warmup-iters" << std::endl;
+                return false;
+            }
+        } else if (arg == "--datatype") {
+            const char *value = requireValue(arg);
+            if (value == nullptr || !ParseDataType(value, options.dtype)) {
+                std::cerr << "ERROR: unsupported --datatype" << std::endl;
+                return false;
+            }
+        } else if (arg == "--rank-size") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            if (!ParseInt(value, options.rankSize)) {
+                std::cerr << "ERROR: invalid --rank-size" << std::endl;
+                return false;
+            }
+        } else if (arg == "--rank") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            if (!ParseInt(value, options.rank)) {
+                std::cerr << "ERROR: invalid --rank" << std::endl;
+                return false;
+            }
+            options.rankSpecified = true;
+        } else if (arg == "--worker") {
+            options.worker = true;
+        } else if (arg == "--first-npu") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            if (!ParseInt(value, options.firstNpu)) {
+                std::cerr << "ERROR: invalid --first-npu" << std::endl;
+                return false;
+            }
+        } else if (arg == "--device-id") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            if (!ParseInt(value, options.deviceIdOverride)) {
+                std::cerr << "ERROR: invalid --device-id" << std::endl;
+                return false;
+            }
+        } else if (arg == "--timeout-sec") {
+            const char *value = requireValue(arg);
+            if (value == nullptr || !ParseInt(value, options.timeoutSec)) {
+                std::cerr << "ERROR: invalid --timeout-sec" << std::endl;
+                return false;
+            }
+        } else if (arg == "--log-dir") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            options.logDir = value;
+        } else if (arg == "--comm-mode") {
+            const char *value = requireValue(arg);
+            if (value == nullptr || !ParseCommMode(value, options.commMode)) {
+                std::cerr << "ERROR: --comm-mode must be local or socket" << std::endl;
+                return false;
+            }
+        } else if (arg == "--check") {
+            const char *value = requireValue(arg);
+            if (value == nullptr || !ParseBool(value, options.check)) {
+                std::cerr << "ERROR: --check must be 0 or 1" << std::endl;
+                return false;
+            }
+        } else if (arg == "--csv") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            options.csvPath = value;
+        } else if (arg == "--min-algbw") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            if (!ParseDouble(value, options.minAlgBw)) {
+                std::cerr << "ERROR: invalid --min-algbw" << std::endl;
+                return false;
+            }
+        } else if (arg == "--max-latency-us") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            if (!ParseDouble(value, options.maxLatencyUs)) {
+                std::cerr << "ERROR: invalid --max-latency-us" << std::endl;
+                return false;
+            }
+        } else if (arg == "--profile") {
+            const char *value = requireValue(arg);
+            if (value == nullptr || !ParseBool(value, options.profile)) {
+                std::cerr << "ERROR: --profile must be 0 or 1" << std::endl;
+                return false;
+            }
+        } else if (arg == "--profile-dir") {
+            const char *value = requireValue(arg);
+            if (value == nullptr) {
+                return false;
+            }
+            options.profileDir = value;
+        } else if (arg == "--profile-ai-prompt") {
+            const char *value = requireValue(arg);
+            if (value == nullptr || !ParseBool(value, options.profileAiPrompt)) {
+                std::cerr << "ERROR: --profile-ai-prompt must be 0 or 1" << std::endl;
+                return false;
+            }
+        } else if (arg == "--profile-sample-every") {
+            const char *value = requireValue(arg);
+            if (value == nullptr || !ParseInt(value, options.profileSampleEvery)) {
+                std::cerr << "ERROR: invalid --profile-sample-every" << std::endl;
+                return false;
+            }
+        } else if (arg == "--help" || arg == "-h") {
+            PrintUsage(argv[0]);
+            std::exit(0);
+        } else {
+            std::cerr << "ERROR: unknown argument " << arg << std::endl;
+            return false;
+        }
+    }
+
+    const bool workerMode = options.worker || options.rankSpecified;
+    if (options.minBytes <= 0 || options.maxBytes < options.minBytes || options.stepFactor <= 1.0 ||
+        options.iters <= 0 || options.warmupIters < 0 || options.rankSize <= 0 || options.firstNpu < 0 ||
+        options.deviceIdOverride < -1 || options.timeoutSec <= 0 || options.logDir.empty() ||
+        (workerMode && (options.rank < 0 || options.rank >= options.rankSize))) {
+        std::cerr << "ERROR: invalid option value" << std::endl;
+        return false;
+    }
+    if (options.worker && !options.rankSpecified) {
+        std::cerr << "ERROR: --worker requires --rank" << std::endl;
+        return false;
+    }
+    if (!workerMode && options.deviceIdOverride >= 0) {
+        std::cerr << "ERROR: --device-id is valid only for a single rank worker" << std::endl;
+        return false;
+    }
+    if (options.profileSampleEvery <= 0) {
+        std::cerr << "ERROR: --profile-sample-every must be positive" << std::endl;
+        return false;
+    }
+    if (options.check && options.dtype.name != "int32" && IsReductionOp(options.op)) {
+        std::cerr << "ERROR: --check=1 for allreduce/reducescatter requires --datatype int32" << std::endl;
+        return false;
+    }
+    if (!ValidateMaxMessageSize(options)) {
+        return false;
+    }
+    return true;
+}
+
+bool CheckAcl(int rank, const std::string &step, aclError ret)
+{
+    if (ret == ACL_SUCCESS) {
+        return true;
+    }
+    std::cerr << "[rank " << rank << "] ERROR: " << step << " failed, ret=" << ret << std::endl;
+    return false;
+}
+
+bool CheckTileXR(int rank, const std::string &step, int ret)
+{
+    if (ret == TileXR::TILEXR_SUCCESS) {
+        return true;
+    }
+    std::cerr << "[rank " << rank << "] ERROR: " << step << " failed, ret=" << ret << std::endl;
+    return false;
+}
+
+bool CallCollective(const Options &options, void *sendBuf, void *recvBuf, int64_t count, TileXRCommPtr comm,
+                    aclrtStream stream)
+{
+    switch (options.op) {
+        case CollectiveOp::ALLGATHER:
+            return CheckTileXR(options.rank, "TileXRAllGather",
+                TileXRAllGather(sendBuf, recvBuf, count, options.dtype.type, comm, stream));
+        case CollectiveOp::ALLTOALL:
+            return CheckTileXR(options.rank, "TileXRAllToAll",
+                TileXRAllToAll(sendBuf, recvBuf, count, options.dtype.type, comm, stream));
+        case CollectiveOp::ALLREDUCE:
+            return CheckTileXR(options.rank, "TileXRAllReduce",
+                TileXRAllReduce(sendBuf, recvBuf, count, options.dtype.type,
+                                TileXR::TILEXR_REDUCE_SUM, comm, stream));
+        case CollectiveOp::REDUCESCATTER:
+            return CheckTileXR(options.rank, "TileXRReduceScatter",
+                TileXRReduceScatter(sendBuf, recvBuf, count, options.dtype.type,
+                                    TileXR::TILEXR_REDUCE_SUM, comm, stream));
+        case CollectiveOp::BROADCAST:
+            return CheckTileXR(options.rank, "TileXRBroadcast",
+                TileXRBroadcast(sendBuf, count, options.dtype.type, 0, comm, stream));
+        case CollectiveOp::NOOP:
+            (void)sendBuf;
+            (void)recvBuf;
+            (void)count;
+            (void)comm;
+            (void)stream;
+            return true;
+        case CollectiveOp::PROFILE_PROBE:
+            return CheckTileXR(options.rank, "TileXRProfileProbe",
+                TileXRProfileProbe(sendBuf, recvBuf, count, options.dtype.type, comm, stream));
+    }
+    return false;
+}
+
+bool FillPattern(const Options &options, int64_t count, std::vector<uint8_t> &send, std::vector<uint8_t> &recv)
+{
+    if (options.dtype.name == "int32") {
+        switch (options.op) {
+            case CollectiveOp::ALLGATHER:
+            case CollectiveOp::ALLREDUCE:
+                for (int64_t i = 0; i < count; ++i) {
+                    StoreInt32(send, i, ExpectedAllGatherValue(options.rankSize, options.rank, i));
+                }
+                break;
+            case CollectiveOp::ALLTOALL:
+                for (int dst = 0; dst < options.rankSize; ++dst) {
+                    for (int64_t i = 0; i < count; ++i) {
+                        StoreInt32(send, static_cast<int64_t>(dst) * count + i,
+                            ExpectedAllToAllValue(options.rankSize, options.rank, dst, i));
+                    }
+                }
+                break;
+            case CollectiveOp::REDUCESCATTER:
+                for (int64_t i = 0; i < count * static_cast<int64_t>(options.rankSize); ++i) {
+                    StoreInt32(send, i, ExpectedAllGatherValue(options.rankSize, options.rank, i));
+                }
+                break;
+            case CollectiveOp::BROADCAST:
+                for (int64_t i = 0; i < count; ++i) {
+                    const int32_t value = options.rank == 0 ?
+                        ExpectedAllGatherValue(options.rankSize, 0, i) : -1;
+                    StoreInt32(send, i, value);
+                }
+                break;
+            case CollectiveOp::PROFILE_PROBE:
+                for (int64_t i = 0; i < count; ++i) {
+                    StoreInt32(send, i, ExpectedAllGatherValue(options.rankSize, options.rank, i));
+                }
+                break;
+            case CollectiveOp::NOOP:
+                break;
+        }
+        std::fill(recv.begin(), recv.end(), 0xff);
+        return true;
+    }
+
+    switch (options.op) {
+        case CollectiveOp::ALLGATHER:
+        case CollectiveOp::ALLREDUCE:
+        case CollectiveOp::REDUCESCATTER:
+            for (size_t i = 0; i < send.size(); ++i) {
+                send[i] = PatternByte(options.rank, 0, static_cast<int64_t>(i));
+            }
+            break;
+        case CollectiveOp::ALLTOALL: {
+            const size_t bytesPerPeer = static_cast<size_t>(count) * options.dtype.bytes;
+            for (int dst = 0; dst < options.rankSize; ++dst) {
+                for (size_t i = 0; i < bytesPerPeer; ++i) {
+                    send[static_cast<size_t>(dst) * bytesPerPeer + i] =
+                        PatternByte(options.rank, dst, static_cast<int64_t>(i));
+                }
+            }
+            break;
+        }
+        case CollectiveOp::BROADCAST:
+            for (size_t i = 0; i < send.size(); ++i) {
+                send[i] = options.rank == 0 ? PatternByte(0, 0, static_cast<int64_t>(i)) : 0xff;
+            }
+            break;
+        case CollectiveOp::PROFILE_PROBE:
+            for (size_t i = 0; i < send.size(); ++i) {
+                send[i] = PatternByte(options.rank, 0, static_cast<int64_t>(i));
+            }
+            break;
+        case CollectiveOp::NOOP:
+            break;
+    }
+    std::fill(recv.begin(), recv.end(), 0xff);
+    return true;
+}
+
+int ValidateInt32(const Options &options, int64_t count, const std::vector<uint8_t> &recv)
+{
+    int errors = 0;
+    switch (options.op) {
+        case CollectiveOp::ALLGATHER:
+            for (int src = 0; src < options.rankSize; ++src) {
+                for (int64_t i = 0; i < count; ++i) {
+                    const int64_t index = static_cast<int64_t>(src) * count + i;
+                    const int32_t expected = ExpectedAllGatherValue(options.rankSize, src, i);
+                    const int32_t actual = LoadInt32(recv, index);
+                    if (actual != expected) {
+                        if (errors < 8) {
+                            std::cerr << "[rank " << options.rank << "] allgather mismatch src=" << src
+                                      << " i=" << i << " expected=" << expected
+                                      << " actual=" << actual << std::endl;
+                        }
+                        ++errors;
+                    }
+                }
+            }
+            break;
+        case CollectiveOp::ALLTOALL:
+            for (int src = 0; src < options.rankSize; ++src) {
+                for (int64_t i = 0; i < count; ++i) {
+                    const int64_t index = static_cast<int64_t>(src) * count + i;
+                    const int32_t expected = ExpectedAllToAllValue(options.rankSize, src, options.rank, i);
+                    const int32_t actual = LoadInt32(recv, index);
+                    if (actual != expected) {
+                        if (errors < 8) {
+                            std::cerr << "[rank " << options.rank << "] alltoall mismatch src=" << src
+                                      << " i=" << i << " expected=" << expected
+                                      << " actual=" << actual << std::endl;
+                        }
+                        ++errors;
+                    }
+                }
+            }
+            break;
+        case CollectiveOp::ALLREDUCE:
+            for (int64_t i = 0; i < count; ++i) {
+                const int32_t expected = ExpectedAllReduceSum(options.rankSize, i);
+                const int32_t actual = LoadInt32(recv, i);
+                if (actual != expected) {
+                    if (errors < 8) {
+                        std::cerr << "[rank " << options.rank << "] allreduce mismatch"
+                                  << " i=" << i << " expected=" << expected
+                                  << " actual=" << actual << std::endl;
+                    }
+                    ++errors;
+                }
+            }
+            break;
+        case CollectiveOp::REDUCESCATTER:
+            for (int64_t i = 0; i < count; ++i) {
+                const int32_t expected = ExpectedReduceScatterSum(options.rankSize, options.rank, count, i);
+                const int32_t actual = LoadInt32(recv, i);
+                if (actual != expected) {
+                    if (errors < 8) {
+                        std::cerr << "[rank " << options.rank << "] reducescatter mismatch"
+                                  << " i=" << i << " expected=" << expected
+                                  << " actual=" << actual << std::endl;
+                    }
+                    ++errors;
+                }
+            }
+            break;
+        case CollectiveOp::BROADCAST:
+            for (int64_t i = 0; i < count; ++i) {
+                const int32_t expected = ExpectedAllGatherValue(options.rankSize, 0, i);
+                const int32_t actual = LoadInt32(recv, i);
+                if (actual != expected) {
+                    if (errors < 8) {
+                        std::cerr << "[rank " << options.rank << "] broadcast mismatch"
+                                  << " i=" << i << " expected=" << expected
+                                  << " actual=" << actual << std::endl;
+                    }
+                    ++errors;
+                }
+            }
+            break;
+        case CollectiveOp::PROFILE_PROBE:
+            for (int64_t i = 0; i < count; ++i) {
+                const int32_t expected = ExpectedAllGatherValue(options.rankSize, options.rank, i);
+                const int32_t actual = LoadInt32(recv, i);
+                if (actual != expected) {
+                    if (errors < 8) {
+                        std::cerr << "[rank " << options.rank << "] profile-probe mismatch"
+                                  << " i=" << i << " expected=" << expected
+                                  << " actual=" << actual << std::endl;
+                    }
+                    ++errors;
+                }
+            }
+            break;
+        case CollectiveOp::NOOP:
+            break;
+    }
+    return errors;
+}
+
+int ValidateBytePattern(const Options &options, int64_t count, const std::vector<uint8_t> &recv)
+{
+    int errors = 0;
+    const size_t bytesPerPeer = static_cast<size_t>(count) * options.dtype.bytes;
+    switch (options.op) {
+        case CollectiveOp::ALLGATHER:
+            for (int src = 0; src < options.rankSize; ++src) {
+                for (size_t i = 0; i < bytesPerPeer; ++i) {
+                    const uint8_t expected = PatternByte(src, 0, static_cast<int64_t>(i));
+                    const uint8_t actual = recv[static_cast<size_t>(src) * bytesPerPeer + i];
+                    if (actual != expected) {
+                        if (errors < 8) {
+                            std::cerr << "[rank " << options.rank << "] byte allgather mismatch src=" << src
+                                      << " byte=" << i << " expected=" << static_cast<int>(expected)
+                                      << " actual=" << static_cast<int>(actual) << std::endl;
+                        }
+                        ++errors;
+                    }
+                }
+            }
+            break;
+        case CollectiveOp::ALLTOALL:
+            for (int src = 0; src < options.rankSize; ++src) {
+                for (size_t i = 0; i < bytesPerPeer; ++i) {
+                    const uint8_t expected = PatternByte(src, options.rank, static_cast<int64_t>(i));
+                    const uint8_t actual = recv[static_cast<size_t>(src) * bytesPerPeer + i];
+                    if (actual != expected) {
+                        if (errors < 8) {
+                            std::cerr << "[rank " << options.rank << "] byte alltoall mismatch src=" << src
+                                      << " byte=" << i << " expected=" << static_cast<int>(expected)
+                                      << " actual=" << static_cast<int>(actual) << std::endl;
+                        }
+                        ++errors;
+                    }
+                }
+            }
+            break;
+        case CollectiveOp::BROADCAST:
+            for (size_t i = 0; i < bytesPerPeer; ++i) {
+                const uint8_t expected = PatternByte(0, 0, static_cast<int64_t>(i));
+                const uint8_t actual = recv[i];
+                if (actual != expected) {
+                    if (errors < 8) {
+                        std::cerr << "[rank " << options.rank << "] byte broadcast mismatch"
+                                  << " byte=" << i << " expected=" << static_cast<int>(expected)
+                                  << " actual=" << static_cast<int>(actual) << std::endl;
+                    }
+                    ++errors;
+                }
+            }
+            break;
+        case CollectiveOp::PROFILE_PROBE:
+            for (size_t i = 0; i < bytesPerPeer; ++i) {
+                const uint8_t expected = PatternByte(options.rank, 0, static_cast<int64_t>(i));
+                const uint8_t actual = recv[i];
+                if (actual != expected) {
+                    if (errors < 8) {
+                        std::cerr << "[rank " << options.rank << "] byte profile-probe mismatch"
+                                  << " byte=" << i << " expected=" << static_cast<int>(expected)
+                                  << " actual=" << static_cast<int>(actual) << std::endl;
+                    }
+                    ++errors;
+                }
+            }
+            break;
+        case CollectiveOp::ALLREDUCE:
+        case CollectiveOp::REDUCESCATTER:
+            std::cerr << "[rank " << options.rank
+                      << "] ERROR: byte validation is unsupported for allreduce/reducescatter" << std::endl;
+            ++errors;
+            break;
+        case CollectiveOp::NOOP:
+            break;
+    }
+    return errors;
+}
+
+double ComputeAlgBandwidthGbps(int64_t outputBytesPerRank, double avgUs)
+{
+    if (avgUs <= 0.0) {
+        return 0.0;
+    }
+    return static_cast<double>(outputBytesPerRank) / avgUs / 1000.0;
+}
+
+double ComputeBusBandwidthGbps(CollectiveOp op, int rankSize, double algBwGbps)
+{
+    if (op == CollectiveOp::NOOP || op == CollectiveOp::PROFILE_PROBE) {
+        return 0.0;
+    }
+    if (rankSize <= 0) {
+        return 0.0;
+    }
+    return algBwGbps * static_cast<double>(rankSize - 1) / static_cast<double>(rankSize);
+}
+
+bool MeasureOnce(const Options &options, void *devSend, void *devRecv, int64_t count, TileXRCommPtr comm,
+                 aclrtStream stream, uint64_t profileLaunchIndex, int &totalErrors, double &us)
+{
+    aclrtEvent start = nullptr;
+    aclrtEvent stop = nullptr;
+    if (!CheckAcl(options.rank, "aclrtCreateEvent start", aclrtCreateEvent(&start)) ||
+        !CheckAcl(options.rank, "aclrtCreateEvent stop", aclrtCreateEvent(&stop)) ||
+        !CheckAcl(options.rank, "aclrtRecordEvent start", aclrtRecordEvent(start, stream))) {
+        if (start != nullptr) {
+            aclrtDestroyEvent(start);
+        }
+        if (stop != nullptr) {
+            aclrtDestroyEvent(stop);
+        }
+        return false;
+    }
+    TileXRCollectivePerfSession perfSession = nullptr;
+    if (ProfileThisLaunch(options, profileLaunchIndex) &&
+        !StartPerfSessionForLaunch(options, profileLaunchIndex, perfSession)) {
+        aclrtDestroyEvent(start);
+        aclrtDestroyEvent(stop);
+        return false;
+    }
+    std::string incompleteReason;
+    if (!CallCollective(options, devSend, devRecv, count, comm, stream)) {
+        incompleteReason = "CallCollective failed before measured launch completed";
+    } else if (!CheckAcl(options.rank, "aclrtRecordEvent stop", aclrtRecordEvent(stop, stream))) {
+        incompleteReason = "aclrtRecordEvent stop failed";
+    } else if (!CheckAcl(options.rank, "aclrtSynchronizeEvent stop", aclrtSynchronizeEvent(stop))) {
+        incompleteReason = "aclrtSynchronizeEvent stop failed";
+    }
+    if (!incompleteReason.empty()) {
+        FinishPerfSession(perfSession, options, stream, totalErrors, true, incompleteReason);
+        aclrtDestroyEvent(start);
+        aclrtDestroyEvent(stop);
+        return false;
+    }
+    FinishPerfSession(perfSession, options, stream, totalErrors, false, "");
+
+    float elapsedMs = 0.0f;
+    const bool ok = CheckAcl(options.rank, "aclrtEventElapsedTime",
+        aclrtEventElapsedTime(&elapsedMs, start, stop));
+    aclrtDestroyEvent(start);
+    aclrtDestroyEvent(stop);
+    us = static_cast<double>(elapsedMs) * 1000.0;
+    if (!ok) {
+        return false;
+    }
+    return true;
+}
+
+bool Measure(const Options &options, void *devSend, void *devRecv, int64_t count, TileXRCommPtr comm,
+             aclrtStream stream, uint64_t &profileLaunchIndex, int &totalErrors, Measurement &measurement)
+{
+    for (int i = 0; i < options.warmupIters; ++i) {
+        if (!CallCollective(options, devSend, devRecv, count, comm, stream)) {
+            return false;
+        }
+    }
+    if (!CheckAcl(options.rank, "aclrtSynchronizeStream warmup", aclrtSynchronizeStream(stream))) {
+        return false;
+    }
+
+    std::vector<double> samples;
+    samples.reserve(static_cast<size_t>(options.iters));
+    for (int i = 0; i < options.iters; ++i) {
+        double us = 0.0;
+        const uint64_t currentProfileLaunchIndex = profileLaunchIndex++;
+        if (!MeasureOnce(options, devSend, devRecv, count, comm, stream,
+                currentProfileLaunchIndex, totalErrors, us)) {
+            return false;
+        }
+        samples.push_back(us);
+    }
+    const auto minmax = std::minmax_element(samples.begin(), samples.end());
+    double sum = 0.0;
+    for (double value : samples) {
+        sum += value;
+    }
+    measurement.avgUs = sum / static_cast<double>(samples.size());
+    measurement.minUs = *minmax.first;
+    measurement.maxUs = *minmax.second;
+    return true;
+}
+
+void PrintHeader()
+{
+    std::cout << "op dtype ranks bytes count iters algbw(GB/s) busbw(GB/s) avg(us) min(us) max(us) errors"
+              << std::endl;
+}
+
+void PrintRow(const Row &row)
+{
+    std::cout << row.op << ' ' << row.dtype << ' ' << row.ranks << ' ' << row.bytes << ' '
+              << row.count << ' ' << row.iters << ' '
+              << std::fixed << std::setprecision(3)
+              << row.algBw << ' ' << row.busBw << ' ' << row.avgUs << ' '
+              << row.minUs << ' ' << row.maxUs << ' ' << row.errors << std::endl;
+}
+
+bool AppendCsv(const std::string &path, const Row &row)
+{
+    if (path.empty()) {
+        return true;
+    }
+    std::ifstream existing(path.c_str());
+    const bool needsHeader = !existing.good() || existing.peek() == std::ifstream::traits_type::eof();
+    existing.close();
+
+    std::ofstream out(path.c_str(), std::ios::app);
+    if (!out.is_open()) {
+        std::cerr << "ERROR: failed to open CSV " << path << std::endl;
+        return false;
+    }
+    if (needsHeader) {
+        out << "op,dtype,ranks,bytes,count,iters,algbw(GB/s),busbw(GB/s),avg(us),min(us),max(us),errors\n";
+    }
+    out << row.op << ',' << row.dtype << ',' << row.ranks << ',' << row.bytes << ','
+        << row.count << ',' << row.iters << ',' << std::fixed << std::setprecision(6)
+        << row.algBw << ',' << row.busBw << ',' << row.avgUs << ','
+        << row.minUs << ',' << row.maxUs << ',' << row.errors << '\n';
+    return true;
+}
+
+std::string JoinPath(const std::string &base, const std::string &leaf)
+{
+    if (base.empty() || base[base.size() - 1] == '/') {
+        return base + leaf;
+    }
+    return base + "/" + leaf;
+}
+
+bool CreateDirectories(const std::string &path)
+{
+    if (path.empty()) {
+        return false;
+    }
+
+    std::string current;
+    size_t index = 0;
+    if (path[0] == '/') {
+        current = "/";
+        index = 1;
+    }
+
+    while (index <= path.size()) {
+        const size_t next = path.find('/', index);
+        const std::string part = path.substr(index, next == std::string::npos ? std::string::npos : next - index);
+        if (!part.empty()) {
+            if (!current.empty() && current[current.size() - 1] != '/') {
+                current += "/";
+            }
+            current += part;
+            if (mkdir(current.c_str(), 0755) != 0 && errno != EEXIST) {
+                std::cerr << "ERROR: failed to create directory " << current << ": " << strerror(errno) << std::endl;
+                return false;
+            }
+        }
+        if (next == std::string::npos) {
+            break;
+        }
+        index = next + 1;
+    }
+    return true;
+}
+
+std::string JsonEscape(const std::string &text)
+{
+    std::ostringstream out;
+    for (const char ch : text) {
+        switch (ch) {
+            case '\\':
+                out << "\\\\";
+                break;
+            case '"':
+                out << "\\\"";
+                break;
+            case '\n':
+                out << "\\n";
+                break;
+            case '\r':
+                out << "\\r";
+                break;
+            case '\t':
+                out << "\\t";
+                break;
+            default:
+                out << ch;
+                break;
+        }
+    }
+    return out.str();
+}
+
+std::string EnvOrEmpty(const char *name)
+{
+    const char *value = std::getenv(name);
+    return value == nullptr ? std::string() : std::string(value);
+}
+
+std::string HostEpochNs()
+{
+    struct timespec ts {};
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        return "";
+    }
+    std::ostringstream out;
+    out << static_cast<long long>(ts.tv_sec) << std::setw(9) << std::setfill('0')
+        << static_cast<long long>(ts.tv_nsec);
+    return out.str();
+}
+
+std::string DefaultHostName()
+{
+    char hostname[256] = {};
+    if (gethostname(hostname, sizeof(hostname) - 1) == 0 && hostname[0] != '\0') {
+        return hostname;
+    }
+    return "unknown";
+}
+
+bool WriteProfileHostInfo(const Options &options)
+{
+    if (!options.profile) {
+        return true;
+    }
+    const std::string root = options.profileDir.empty() ? "run/prof/collectives" : options.profileDir;
+    const std::string rankDir = JoinPath(root, "rank" + std::to_string(options.rank));
+    if (!CreateDirectories(rankDir)) {
+        return false;
+    }
+
+    std::string host = EnvOrEmpty("TILEXR_PROFILE_HOST");
+    if (host.empty()) {
+        host = DefaultHostName();
+    }
+    std::string hostIp = EnvOrEmpty("TILEXR_PROFILE_HOST_IP");
+    if (hostIp.empty()) {
+        hostIp = EnvOrEmpty("TILEXR_NODE_IP");
+    }
+    const std::string clockOffsetNs = EnvOrEmpty("TILEXR_PROFILE_CLOCK_OFFSET_NS");
+    const std::string clockReference = EnvOrEmpty("TILEXR_PROFILE_CLOCK_SYNC_REFERENCE");
+    const std::string epochNs = HostEpochNs();
+
+    const std::string path = JoinPath(rankDir, "host_info.json");
+    std::ofstream out(path.c_str());
+    if (!out.is_open()) {
+        std::cerr << "ERROR: failed to write " << path << std::endl;
+        return false;
+    }
+    out << "{\n"
+        << "  \"schema\": \"tilexr_collective_profile_host.v1\",\n"
+        << "  \"rank\": " << options.rank << ",\n"
+        << "  \"rank_size\": " << options.rankSize << ",\n"
+        << "  \"host\": \"" << JsonEscape(host) << "\",\n"
+        << "  \"ip\": \"" << JsonEscape(hostIp) << "\",\n"
+        << "  \"comm_mode\": \"" << CommModeName(options.commMode) << "\",\n"
+        << "  \"clock_offset_ns\": \"" << JsonEscape(clockOffsetNs) << "\",\n"
+        << "  \"clock_reference\": \"" << JsonEscape(clockReference) << "\",\n"
+        << "  \"epoch_ns\": \"" << JsonEscape(epochNs) << "\"\n"
+        << "}\n";
+    return true;
+}
+
+std::string ResolveProfileOutputDir(const Options &options, uint64_t profileLaunchIndex)
+{
+    const std::string root = options.profileDir.empty() ? "run/prof/collectives" : options.profileDir;
+    return JoinPath(JoinPath(root, "rank" + std::to_string(options.rank)),
+                    "launch" + std::to_string(profileLaunchIndex));
+}
+
+bool ProfileThisLaunch(const Options &options, uint64_t profileLaunchIndex)
+{
+    return options.profile && options.profileSampleEvery > 0 &&
+        (profileLaunchIndex % static_cast<uint64_t>(options.profileSampleEvery)) == 0;
+}
+
+bool KernelProfilingDisabled()
+{
+    const char *value = std::getenv("TILEXR_COLLECTIVES_DISABLE_KERNEL_PROFILING");
+    return value != nullptr &&
+        (std::string(value) == "1" || std::string(value) == "true" || std::string(value) == "yes");
+}
+
+bool StartPerfSessionForLaunch(const Options &options, uint64_t profileLaunchIndex,
+                               TileXRCollectivePerfSession &perfSession)
+{
+    const std::string outputDir = ResolveProfileOutputDir(options, profileLaunchIndex);
+    TileXRCollectivePerfConfig perfConfig {};
+    perfConfig.enabled = 1;
+    perfConfig.outputDir = outputDir.c_str();
+    perfConfig.emitAiPrompt = options.profileAiPrompt ? 1 : 0;
+    perfConfig.sampleEveryN = static_cast<unsigned int>(options.profileSampleEvery);
+    if (!CheckTileXR(options.rank, "TileXRCollectivePerfSessionCreate",
+            TileXRCollectivePerfSessionCreate(&perfConfig, &perfSession))) {
+        return false;
+    }
+    if (!CheckTileXR(options.rank, "TileXRCollectivePerfSetActiveSession",
+            TileXRCollectivePerfSetActiveSession(perfSession))) {
+        TileXRCollectivePerfSessionDestroy(perfSession);
+        perfSession = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void Cleanup(TileXRCommPtr comm, aclrtStream stream, int deviceId, bool deviceSet)
+{
+    if (comm != nullptr) {
+        TileXRCommDestroy(comm);
+    }
+    if (stream != nullptr) {
+        aclrtDestroyStream(stream);
+    }
+    if (deviceSet) {
+        aclrtResetDevice(deviceId);
+    }
+    aclFinalize();
+}
+
+void FinishPerfSession(TileXRCollectivePerfSession &perfSession, const Options &options, aclrtStream stream,
+                       int &totalErrors, bool skipWriteReport, const std::string &skipReason)
+{
+    if (perfSession == nullptr) {
+        return;
+    }
+    std::string reason = skipReason;
+    bool streamSynced = true;
+    if (stream != nullptr && !KernelProfilingDisabled()) {
+        streamSynced = CheckAcl(options.rank, "aclrtSynchronizeStream before perf report",
+            aclrtSynchronizeStream(stream));
+        if (!streamSynced) {
+            totalErrors += 1;
+            skipWriteReport = true;
+            if (reason.empty()) {
+                reason = "aclrtSynchronizeStream before perf report failed";
+            }
+        }
+    }
+    if (TileXRCollectivePerfSetActiveSession(nullptr) != TileXR::TILEXR_SUCCESS) {
+        std::cerr << "[rank " << options.rank << "] ERROR: TileXRCollectivePerfSetActiveSession clear failed"
+                  << std::endl;
+        totalErrors += 1;
+    }
+    if (skipWriteReport) {
+        if (TileXRCollectivePerfWriteIncompleteReport(perfSession, reason.c_str()) != TileXR::TILEXR_SUCCESS) {
+            std::cerr << "[rank " << options.rank
+                      << "] ERROR: TileXRCollectivePerfWriteIncompleteReport failed" << std::endl;
+            totalErrors += 1;
+        }
+    } else {
+        if (TileXRCollectivePerfWriteReport(perfSession) != TileXR::TILEXR_SUCCESS) {
+            std::cerr << "[rank " << options.rank << "] ERROR: TileXRCollectivePerfWriteReport failed" << std::endl;
+            totalErrors += 1;
+        }
+    }
+    if (!streamSynced) {
+        // Avoid freeing a trace buffer that may still be referenced by queued device work.
+        perfSession = nullptr;
+        return;
+    }
+    if (TileXRCollectivePerfSessionDestroy(perfSession) != TileXR::TILEXR_SUCCESS) {
+        std::cerr << "[rank " << options.rank << "] ERROR: TileXRCollectivePerfSessionDestroy failed" << std::endl;
+        totalErrors += 1;
+    }
+    perfSession = nullptr;
+}
+
+int RunRankWorker(const Options &options)
+{
+    const int deviceId = options.deviceIdOverride >= 0 ? options.deviceIdOverride : options.firstNpu + options.rank;
+    TileXRCommPtr comm = nullptr;
+    aclrtStream stream = nullptr;
+    bool deviceSet = false;
+    if (!CheckAcl(options.rank, "aclInit", aclInit(nullptr))) {
+        return 1;
+    }
+    if (!CheckAcl(options.rank, "aclrtSetDevice", aclrtSetDevice(deviceId))) {
+        Cleanup(comm, stream, deviceId, deviceSet);
+        return 1;
+    }
+    deviceSet = true;
+    if (!WriteProfileHostInfo(options) ||
+        !CheckAcl(options.rank, "aclrtCreateStream", aclrtCreateStream(&stream))) {
+        Cleanup(comm, stream, deviceId, deviceSet);
+        return 1;
+    }
+
+    bool commOk = false;
+    if (options.commMode == CommMode::SOCKET) {
+        TileXRUniqueId uniqueId {};
+        commOk = CheckTileXR(options.rank, "TileXRGetUniqueId", TileXRGetUniqueId(&uniqueId, 0)) &&
+            CheckTileXR(options.rank, "TileXRCommInitRank",
+                TileXRCommInitRank(uniqueId, options.rankSize, options.rank, &comm));
+    } else {
+        commOk = CheckTileXR(options.rank, "TileXRCommInitRankLocal",
+            TileXRCommInitRankLocal(options.rankSize, options.rank, &comm));
+    }
+    if (!commOk) {
+        Cleanup(comm, stream, deviceId, deviceSet);
+        return 1;
+    }
+
+    int totalErrors = 0;
+    uint64_t profileLaunchIndex = 0;
+
+    if (options.rank == 0) {
+        PrintHeader();
+    }
+
+    for (int64_t bytes = options.minBytes;;) {
+        int64_t count = bytes / MessageSizeDivisor(options);
+        if (count <= 0) {
+            count = 1;
+        }
+        int64_t sendElements = 0;
+        int64_t recvElements = 0;
+        int64_t sendBytes = 0;
+        int64_t recvBytes = 0;
+        if (!ComputeMessageSizes(options, count, sendElements, recvElements, sendBytes, recvBytes)) {
+            std::cerr << "ERROR: message size too large" << std::endl;
+            Cleanup(comm, stream, deviceId, deviceSet);
+            return 1;
+        }
+        const int64_t actualSendBytesPerRank = sendBytes;
+
+        std::vector<uint8_t> hostSend(static_cast<size_t>(sendBytes));
+        std::vector<uint8_t> hostRecv(static_cast<size_t>(recvBytes));
+        FillPattern(options, count, hostSend, hostRecv);
+
+        void *devSend = nullptr;
+        void *devRecv = nullptr;
+        bool ok = CheckAcl(options.rank, "aclrtMalloc send",
+            aclrtMalloc(&devSend, static_cast<size_t>(sendBytes), ACL_MEM_MALLOC_HUGE_FIRST)) &&
+            CheckAcl(options.rank, "aclrtMemcpy H2D send",
+                aclrtMemcpy(devSend, static_cast<size_t>(sendBytes), hostSend.data(),
+                    static_cast<size_t>(sendBytes), ACL_MEMCPY_HOST_TO_DEVICE));
+        if (ok) {
+            if (options.op == CollectiveOp::BROADCAST || options.op == CollectiveOp::NOOP) {
+                devRecv = devSend;
+            } else {
+                ok = CheckAcl(options.rank, "aclrtMalloc recv",
+                        aclrtMalloc(&devRecv, static_cast<size_t>(recvBytes), ACL_MEM_MALLOC_HUGE_FIRST)) &&
+                    CheckAcl(options.rank, "aclrtMemcpy H2D recv",
+                        aclrtMemcpy(devRecv, static_cast<size_t>(recvBytes), hostRecv.data(),
+                            static_cast<size_t>(recvBytes), ACL_MEMCPY_HOST_TO_DEVICE));
+            }
+        }
+
+        Measurement measurement;
+        if (ok) {
+            ok = Measure(options, devSend, devRecv, count, comm, stream,
+                profileLaunchIndex, totalErrors, measurement);
+        }
+
+        int errors = 0;
+        if (ok && options.check && options.op != CollectiveOp::NOOP) {
+            if (options.op != CollectiveOp::BROADCAST) {
+                std::fill(hostRecv.begin(), hostRecv.end(), 0xff);
+                ok = CheckAcl(options.rank, "aclrtMemcpy H2D devRecv sentinel",
+                    aclrtMemcpy(devRecv, static_cast<size_t>(recvBytes), hostRecv.data(),
+                        static_cast<size_t>(recvBytes), ACL_MEMCPY_HOST_TO_DEVICE));
+            } else {
+                ok = CheckAcl(options.rank, "aclrtMemcpy H2D broadcast check input",
+                    aclrtMemcpy(devSend, static_cast<size_t>(sendBytes), hostSend.data(),
+                        static_cast<size_t>(sendBytes), ACL_MEMCPY_HOST_TO_DEVICE));
+            }
+            ok = ok &&
+                CallCollective(options, devSend, devRecv, count, comm, stream) &&
+                CheckAcl(options.rank, "aclrtSynchronizeStream check", aclrtSynchronizeStream(stream)) &&
+                CheckAcl(options.rank, "aclrtMemcpy D2H recv",
+                    aclrtMemcpy(hostRecv.data(), static_cast<size_t>(recvBytes), devRecv,
+                        static_cast<size_t>(recvBytes), ACL_MEMCPY_DEVICE_TO_HOST));
+            if (ok) {
+                errors = options.dtype.name == "int32" ?
+                    ValidateInt32(options, count, hostRecv) : ValidateBytePattern(options, count, hostRecv);
+            } else {
+                errors = 1;
+            }
+        }
+
+        if (devSend != nullptr) {
+            aclrtFree(devSend);
+        }
+        if (devRecv != nullptr && devRecv != devSend) {
+            aclrtFree(devRecv);
+        }
+        if (!ok) {
+            Cleanup(comm, stream, deviceId, deviceSet);
+            return 1;
+        }
+
+        const std::string opName = OpName(options.op);
+        const int64_t outputBytesPerRank = recvBytes;
+        const double algBw = ComputeAlgBandwidthGbps(outputBytesPerRank, measurement.avgUs);
+        const double busBw = ComputeBusBandwidthGbps(options.op, options.rankSize, algBw);
+        if (options.minAlgBw >= 0.0 && algBw < options.minAlgBw) {
+            ++errors;
+        }
+        if (options.maxLatencyUs >= 0.0 && measurement.avgUs > options.maxLatencyUs) {
+            ++errors;
+        }
+        totalErrors += errors;
+
+        Row row{opName, options.dtype.name, options.rankSize, actualSendBytesPerRank, count, options.iters,
+            algBw, busBw, measurement.avgUs, measurement.minUs, measurement.maxUs, errors};
+        if (options.rank == 0) {
+            PrintRow(row);
+            if (!AppendCsv(options.csvPath, row)) {
+                Cleanup(comm, stream, deviceId, deviceSet);
+                return 1;
+            }
+        }
+
+        int64_t nextBytes = 0;
+        if (!AdvanceBytes(bytes, options.stepFactor, options.maxBytes, nextBytes)) {
+            std::cerr << "ERROR: message size step overflow" << std::endl;
+            Cleanup(comm, stream, deviceId, deviceSet);
+            return 1;
+        }
+        if (nextBytes <= bytes) {
+            break;
+        }
+        bytes = nextBytes;
+    }
+
+    Cleanup(comm, stream, deviceId, deviceSet);
+    return totalErrors == 0 ? 0 : 1;
+}
+
+} // namespace
+
+int main(int argc, char **argv)
+{
+    Options options;
+    if (!ParseOptions(argc, argv, options)) {
+        PrintUsage(argv[0]);
+        return 2;
+    }
+
+    if (options.worker || options.rankSpecified) {
+        return RunRankWorker(options);
+    }
+
+    TileXRCollectivesTool::LocalLauncherConfig launcherConfig;
+    launcherConfig.rankSize = options.rankSize;
+    launcherConfig.firstNpu = options.firstNpu;
+    launcherConfig.timeoutSec = options.timeoutSec;
+    launcherConfig.logDir = options.logDir;
+    launcherConfig.profileEnabled = options.profile;
+    launcherConfig.profileDir = options.profileDir;
+    launcherConfig.profileAiPrompt = options.profileAiPrompt;
+    launcherConfig.warmupIters = options.warmupIters;
+    launcherConfig.measuredIters = options.iters;
+    launcherConfig.profileSampleEvery = options.profileSampleEvery;
+    return TileXRCollectivesTool::RunLocalLauncher(launcherConfig, argc, argv);
+}

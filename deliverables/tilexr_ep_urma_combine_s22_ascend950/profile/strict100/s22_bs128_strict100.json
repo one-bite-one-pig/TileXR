@@ -1,0 +1,761 @@
+{
+  "aggregation": "maximum across 64 AIV cores per rank, then maximum across ranks per round, then summarize round maxima",
+  "artifact_variant": "r141-o2-inline-p42-s22-qp22-deferred-credit-profile-total-192-20260729-v8",
+  "config": {
+    "bs": 128,
+    "cycle_to_us_divisor": 1000,
+    "doorbell_batch": 1,
+    "hidden": 5120,
+    "pack_cores": 42,
+    "parallel_round_publish": true,
+    "profiling": false,
+    "qp_count": 22,
+    "round_publish_mode": "22 Send-core parallel",
+    "route_seed": 20260728,
+    "send_cores": 22,
+    "top_k": 6
+  },
+  "design": "42-pack/22-send/QP22/DB1, 22 Send-core parallel Round Publish",
+  "measured_rounds": 100,
+  "measurement": "in-kernel max-core critical latency from PIPE_ALL-bracketed GetSystemCycle durations",
+  "rank_size": 8,
+  "round_maxima": [
+    {
+      "max_core": 42,
+      "max_cycles": 92837,
+      "max_rank": 3,
+      "max_us": 92.837,
+      "round": 0
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 95584,
+      "max_rank": 0,
+      "max_us": 95.584,
+      "round": 1
+    },
+    {
+      "max_core": 47,
+      "max_cycles": 102614,
+      "max_rank": 1,
+      "max_us": 102.614,
+      "round": 2
+    },
+    {
+      "max_core": 48,
+      "max_cycles": 94882,
+      "max_rank": 3,
+      "max_us": 94.882,
+      "round": 3
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 94896,
+      "max_rank": 3,
+      "max_us": 94.896,
+      "round": 4
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93332,
+      "max_rank": 3,
+      "max_us": 93.332,
+      "round": 5
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 96494,
+      "max_rank": 5,
+      "max_us": 96.494,
+      "round": 6
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93243,
+      "max_rank": 1,
+      "max_us": 93.243,
+      "round": 7
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 96219,
+      "max_rank": 5,
+      "max_us": 96.219,
+      "round": 8
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 99366,
+      "max_rank": 1,
+      "max_us": 99.366,
+      "round": 9
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 97117,
+      "max_rank": 6,
+      "max_us": 97.117,
+      "round": 10
+    },
+    {
+      "max_core": 47,
+      "max_cycles": 103359,
+      "max_rank": 7,
+      "max_us": 103.359,
+      "round": 11
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 96686,
+      "max_rank": 3,
+      "max_us": 96.686,
+      "round": 12
+    },
+    {
+      "max_core": 49,
+      "max_cycles": 93042,
+      "max_rank": 0,
+      "max_us": 93.042,
+      "round": 13
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 106038,
+      "max_rank": 7,
+      "max_us": 106.038,
+      "round": 14
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93840,
+      "max_rank": 1,
+      "max_us": 93.84,
+      "round": 15
+    },
+    {
+      "max_core": 47,
+      "max_cycles": 95517,
+      "max_rank": 1,
+      "max_us": 95.517,
+      "round": 16
+    },
+    {
+      "max_core": 45,
+      "max_cycles": 91851,
+      "max_rank": 1,
+      "max_us": 91.851,
+      "round": 17
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 94263,
+      "max_rank": 5,
+      "max_us": 94.263,
+      "round": 18
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93296,
+      "max_rank": 2,
+      "max_us": 93.296,
+      "round": 19
+    },
+    {
+      "max_core": 47,
+      "max_cycles": 94633,
+      "max_rank": 3,
+      "max_us": 94.633,
+      "round": 20
+    },
+    {
+      "max_core": 47,
+      "max_cycles": 92588,
+      "max_rank": 2,
+      "max_us": 92.588,
+      "round": 21
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 98084,
+      "max_rank": 6,
+      "max_us": 98.084,
+      "round": 22
+    },
+    {
+      "max_core": 44,
+      "max_cycles": 96500,
+      "max_rank": 6,
+      "max_us": 96.5,
+      "round": 23
+    },
+    {
+      "max_core": 45,
+      "max_cycles": 94611,
+      "max_rank": 1,
+      "max_us": 94.611,
+      "round": 24
+    },
+    {
+      "max_core": 44,
+      "max_cycles": 93204,
+      "max_rank": 0,
+      "max_us": 93.204,
+      "round": 25
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93157,
+      "max_rank": 1,
+      "max_us": 93.157,
+      "round": 26
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93525,
+      "max_rank": 1,
+      "max_us": 93.525,
+      "round": 27
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 96858,
+      "max_rank": 6,
+      "max_us": 96.858,
+      "round": 28
+    },
+    {
+      "max_core": 48,
+      "max_cycles": 93367,
+      "max_rank": 0,
+      "max_us": 93.367,
+      "round": 29
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 92894,
+      "max_rank": 1,
+      "max_us": 92.894,
+      "round": 30
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 103052,
+      "max_rank": 0,
+      "max_us": 103.052,
+      "round": 31
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 92659,
+      "max_rank": 3,
+      "max_us": 92.659,
+      "round": 32
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 99153,
+      "max_rank": 7,
+      "max_us": 99.153,
+      "round": 33
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 92504,
+      "max_rank": 3,
+      "max_us": 92.504,
+      "round": 34
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93893,
+      "max_rank": 3,
+      "max_us": 93.893,
+      "round": 35
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 92963,
+      "max_rank": 1,
+      "max_us": 92.963,
+      "round": 36
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 99528,
+      "max_rank": 7,
+      "max_us": 99.528,
+      "round": 37
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93280,
+      "max_rank": 3,
+      "max_us": 93.28,
+      "round": 38
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 118130,
+      "max_rank": 7,
+      "max_us": 118.13,
+      "round": 39
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 112656,
+      "max_rank": 7,
+      "max_us": 112.656,
+      "round": 40
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 94566,
+      "max_rank": 3,
+      "max_us": 94.566,
+      "round": 41
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93543,
+      "max_rank": 1,
+      "max_us": 93.543,
+      "round": 42
+    },
+    {
+      "max_core": 49,
+      "max_cycles": 99658,
+      "max_rank": 5,
+      "max_us": 99.658,
+      "round": 43
+    },
+    {
+      "max_core": 45,
+      "max_cycles": 95860,
+      "max_rank": 0,
+      "max_us": 95.86,
+      "round": 44
+    },
+    {
+      "max_core": 49,
+      "max_cycles": 92512,
+      "max_rank": 0,
+      "max_us": 92.512,
+      "round": 45
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93379,
+      "max_rank": 1,
+      "max_us": 93.379,
+      "round": 46
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 97260,
+      "max_rank": 1,
+      "max_us": 97.26,
+      "round": 47
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 97570,
+      "max_rank": 6,
+      "max_us": 97.57,
+      "round": 48
+    },
+    {
+      "max_core": 47,
+      "max_cycles": 99685,
+      "max_rank": 6,
+      "max_us": 99.685,
+      "round": 49
+    },
+    {
+      "max_core": 48,
+      "max_cycles": 95539,
+      "max_rank": 7,
+      "max_us": 95.539,
+      "round": 50
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 107808,
+      "max_rank": 5,
+      "max_us": 107.808,
+      "round": 51
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 102066,
+      "max_rank": 5,
+      "max_us": 102.066,
+      "round": 52
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 94283,
+      "max_rank": 3,
+      "max_us": 94.283,
+      "round": 53
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 172318,
+      "max_rank": 7,
+      "max_us": 172.318,
+      "round": 54
+    },
+    {
+      "max_core": 46,
+      "max_cycles": 96459,
+      "max_rank": 7,
+      "max_us": 96.459,
+      "round": 55
+    },
+    {
+      "max_core": 46,
+      "max_cycles": 92559,
+      "max_rank": 1,
+      "max_us": 92.559,
+      "round": 56
+    },
+    {
+      "max_core": 48,
+      "max_cycles": 113402,
+      "max_rank": 3,
+      "max_us": 113.402,
+      "round": 57
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 118541,
+      "max_rank": 3,
+      "max_us": 118.541,
+      "round": 58
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 111644,
+      "max_rank": 3,
+      "max_us": 111.644,
+      "round": 59
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 117121,
+      "max_rank": 7,
+      "max_us": 117.121,
+      "round": 60
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 99859,
+      "max_rank": 1,
+      "max_us": 99.859,
+      "round": 61
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 94272,
+      "max_rank": 3,
+      "max_us": 94.272,
+      "round": 62
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 94563,
+      "max_rank": 7,
+      "max_us": 94.563,
+      "round": 63
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 95914,
+      "max_rank": 3,
+      "max_us": 95.914,
+      "round": 64
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 94368,
+      "max_rank": 1,
+      "max_us": 94.368,
+      "round": 65
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93568,
+      "max_rank": 1,
+      "max_us": 93.568,
+      "round": 66
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93150,
+      "max_rank": 3,
+      "max_us": 93.15,
+      "round": 67
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93778,
+      "max_rank": 1,
+      "max_us": 93.778,
+      "round": 68
+    },
+    {
+      "max_core": 47,
+      "max_cycles": 96219,
+      "max_rank": 7,
+      "max_us": 96.219,
+      "round": 69
+    },
+    {
+      "max_core": 48,
+      "max_cycles": 94637,
+      "max_rank": 3,
+      "max_us": 94.637,
+      "round": 70
+    },
+    {
+      "max_core": 46,
+      "max_cycles": 100145,
+      "max_rank": 1,
+      "max_us": 100.145,
+      "round": 71
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 101305,
+      "max_rank": 1,
+      "max_us": 101.305,
+      "round": 72
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 113548,
+      "max_rank": 5,
+      "max_us": 113.548,
+      "round": 73
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 91662,
+      "max_rank": 7,
+      "max_us": 91.662,
+      "round": 74
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 99096,
+      "max_rank": 7,
+      "max_us": 99.096,
+      "round": 75
+    },
+    {
+      "max_core": 47,
+      "max_cycles": 93238,
+      "max_rank": 1,
+      "max_us": 93.238,
+      "round": 76
+    },
+    {
+      "max_core": 43,
+      "max_cycles": 93246,
+      "max_rank": 3,
+      "max_us": 93.246,
+      "round": 77
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 92544,
+      "max_rank": 1,
+      "max_us": 92.544,
+      "round": 78
+    },
+    {
+      "max_core": 49,
+      "max_cycles": 92559,
+      "max_rank": 0,
+      "max_us": 92.559,
+      "round": 79
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 103367,
+      "max_rank": 7,
+      "max_us": 103.367,
+      "round": 80
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 92181,
+      "max_rank": 3,
+      "max_us": 92.181,
+      "round": 81
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 100428,
+      "max_rank": 6,
+      "max_us": 100.428,
+      "round": 82
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 96705,
+      "max_rank": 6,
+      "max_us": 96.705,
+      "round": 83
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 93072,
+      "max_rank": 3,
+      "max_us": 93.072,
+      "round": 84
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 92995,
+      "max_rank": 1,
+      "max_us": 92.995,
+      "round": 85
+    },
+    {
+      "max_core": 43,
+      "max_cycles": 92916,
+      "max_rank": 3,
+      "max_us": 92.916,
+      "round": 86
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 92896,
+      "max_rank": 3,
+      "max_us": 92.896,
+      "round": 87
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 95742,
+      "max_rank": 1,
+      "max_us": 95.742,
+      "round": 88
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 97517,
+      "max_rank": 5,
+      "max_us": 97.517,
+      "round": 89
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 128881,
+      "max_rank": 7,
+      "max_us": 128.881,
+      "round": 90
+    },
+    {
+      "max_core": 49,
+      "max_cycles": 93904,
+      "max_rank": 4,
+      "max_us": 93.904,
+      "round": 91
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 96924,
+      "max_rank": 7,
+      "max_us": 96.924,
+      "round": 92
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 92668,
+      "max_rank": 3,
+      "max_us": 92.668,
+      "round": 93
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 108305,
+      "max_rank": 6,
+      "max_us": 108.305,
+      "round": 94
+    },
+    {
+      "max_core": 47,
+      "max_cycles": 96999,
+      "max_rank": 6,
+      "max_us": 96.999,
+      "round": 95
+    },
+    {
+      "max_core": 42,
+      "max_cycles": 106158,
+      "max_rank": 4,
+      "max_us": 106.158,
+      "round": 96
+    },
+    {
+      "max_core": 49,
+      "max_cycles": 93934,
+      "max_rank": 2,
+      "max_us": 93.934,
+      "round": 97
+    },
+    {
+      "max_core": 49,
+      "max_cycles": 93970,
+      "max_rank": 0,
+      "max_us": 93.97,
+      "round": 98
+    },
+    {
+      "max_core": 44,
+      "max_cycles": 94086,
+      "max_rank": 1,
+      "max_us": 94.086,
+      "round": 99
+    }
+  ],
+  "schema": "tilexr_ep_urma_combine_strict_kernel_latency.v1",
+  "summary_cycles": {
+    "max": 172318,
+    "mean": 98388.07,
+    "min": 91662,
+    "p50": 94889.0,
+    "p95": 113726.65
+  },
+  "summary_us": {
+    "max": 172.318,
+    "mean": 98.38807000000001,
+    "min": 91.662,
+    "p50": 94.88900000000001,
+    "p95": 113.72664999999999
+  },
+  "topology": {
+    "host_count": 1,
+    "nodes": [
+      {
+        "devices": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "host": "root@141.61.49.192",
+        "rank_begin": 0,
+        "rank_end": 7
+      }
+    ],
+    "ranks_per_host": 8
+  },
+  "warmup_rounds": 20
+}

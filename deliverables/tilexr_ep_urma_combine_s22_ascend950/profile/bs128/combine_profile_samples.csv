@@ -1,0 +1,11 @@
+launch,tx_ready_shared_flag,tx_ready_in_data,tx_meta_prefetch_full,tx_ready_early_publish,rx_ready_sticky_mask,rx_ready_batch_mte2,rx_ready_batch_vector,send_route_balanced,coarse_kernel_max_us,coarse_kernel_max_rank,coarse_kernel_max_core,fine_kernel_max_us,fine_kernel_max_rank,fine_kernel_max_core,start_gate_executed,start_gate_max_us,start_gate_max_rank,start_gate_max_core,start_gate_wqes_total,start_gate_doorbells_total,start_gate_quiets_total
+launch0,False,False,False,False,True,False,False,True,88.542,1,42,104.482,1,47,True,255.581,0,49,56,56,56
+launch1,False,False,False,False,True,False,False,True,86.662,2,45,93.747,2,48,True,258.221,0,20,56,56,56
+launch2,False,False,False,False,True,False,False,True,91.604,0,42,94.139,2,42,True,255.819,0,13,56,56,56
+launch3,False,False,False,False,True,False,False,True,88.405,0,45,97.981,2,46,True,254.919,0,55,56,56,56
+launch4,False,False,False,False,True,False,False,True,90.585,0,45,97.691,2,42,True,265.151,0,22,56,56,56
+launch5,False,False,False,False,True,False,False,True,87.348,3,42,97.272,5,42,True,261.762,0,30,56,56,56
+launch6,False,False,False,False,True,False,False,True,97.182,3,48,101.211,0,49,True,297.693,0,29,56,56,56
+launch7,False,False,False,False,True,False,False,True,94.746,3,42,96.296,2,43,True,310.296,0,31,56,56,56
+launch8,False,False,False,False,True,False,False,True,89.989,0,48,98.252,7,46,True,267.019,0,29,56,56,56
+launch9,False,False,False,False,True,False,False,True,88.874,1,45,97.335,2,43,True,248.985,0,8,56,56,56

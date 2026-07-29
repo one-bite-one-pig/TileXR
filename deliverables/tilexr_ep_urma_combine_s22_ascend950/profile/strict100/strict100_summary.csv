@@ -1,0 +1,3 @@
+layout,bs,samples,min_cycles,median_cycles,mean_cycles,p95_cycles,max_cycles
+p42-s22,32,100,40481,43130,44497.38,54420.70,65092
+p42-s22,128,100,91662,94889,98388.07,113726.65,172318

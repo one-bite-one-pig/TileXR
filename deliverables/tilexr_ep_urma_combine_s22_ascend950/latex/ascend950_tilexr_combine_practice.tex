@@ -1,0 +1,193 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{xurl}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\hypersetup{colorlinks=true,linkcolor=blue!55!black,urlcolor=blue!55!black}
+\setlist{nosep}
+
+\title{昇腾 950 上 TileXR URMA Combine 算子的实践与学习总结}
+\author{TileXR Combine Optimization Practice}
+\date{2026 年 7 月}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文总结在昇腾 950/950PR 平台上开发、验证和优化 TileXR EP URMA Combine
+算子的实践。工作的核心并不是寻找单个“神奇”优化，而是建立可信的测量口径，
+逐步分离编译代码生成、核内同步、UDMA 提交、路由调度和 profiling 插桩的影响。
+最终在八卡、H=5120、top-k=6 的固定负载下，选择 P42/S22/QP22/O2 作为双负载
+最优配置。其 profiling-off strict kernel 中位数为 BS32 的 43,130 cycles 和
+BS128 的 94,889 cycles。本文也记录了错误方向、证据纪律和可复现交付方法。
+\end{abstract}
+
+\section{问题背景}
+
+MoE Combine 将来自远端专家的 token 数据接收、反量化并写回目标位置，同时还要
+处理本地 token 和跨 rank 的轮次复用。初期观察到的数百微秒结果与目标几十微秒
+存在明显差距。这个差距一度可能被误认为硬件频率、blockDim、Host launch 或核函数
+分波问题，但逐项验证后确认：关键矛盾来自低层代码生成、核内协议同步以及 profiling
+方式本身，而不是 cycle 换算错误。
+
+昇腾 950 提供 32 个 AI Core、64 个逻辑 AIV。Combine 使用 64 个 AIV block，
+每个 block 都有有效 trace。核内时间通过 AIV 上的 \texttt{GetSystemCycle} 测量，
+显示时沿用 $1000\ \mathrm{cycles}/\mu s$ 的约定，同时始终保留 raw cycles。
+
+\section{可信测量体系}
+
+\subsection{三层聚合}
+
+性能选择统一使用以下聚合顺序：
+\begin{enumerate}
+  \item 每个 rank 内取 64 个 AIV core 的最大值；
+  \item 每次 launch 在 8 个 rank 中取最大值；
+  \item 对有效 launch 取中位数。
+\end{enumerate}
+
+这一口径表达的是分布式请求的关键路径，而不是平均 core-time。生产 winner 使用
+profiling-off 的 \texttt{strictKernelCycles}，边界为
+\texttt{PIPE\_ALL -- GetSystemCycle -- kernel -- PIPE\_ALL}。
+
+\subsection{Strict、total-only 与 attribution profile}
+
+早期 coarse/fine profile 在每个阶段记录时间和计数，插桩会改变分支、同步和代码布局，
+因此绝对时间明显高于 strict。后来新增 total-only 模式，只记录
+\texttt{kernel\_total}，禁用内部阶段插桩，并采用与 strict 相同的
+\texttt{PIPE\_ALL} 边界。
+
+在 S22/BS32 上，matched strict10 为 41,703.5 cycles，total-only10 为
+41,126 cycles，差异仅 $-1.38\%$。这说明旧 profile 的大幅膨胀主要是观测方式造成的，
+而不是生产 kernel 的真实成本。coarse/fine 此后只用于归因，不再选择 winner。
+
+\section{编译优化与内联}
+
+实际 BiSheng 命令和 driver 展开参数表明，必须显式控制 kernel 优化级别，不能只从
+CMake 源码猜测默认值。实验覆盖 default、O0、O2 和 O3，并额外排查内联导致的数值
+问题。最终交付选择 O2 和正常内联：它保留主要内联收益，同时通过 smoke correctness
+和双负载 strict 测试。O0 仅具有诊断意义，不是生产选择；O3 没有获得足以覆盖稳定性
+风险的双负载优势。
+
+这段经历的重要教训是：优化级别会同时改变性能和潜在未定义行为的显现方式。遇到
+O2/O3 数值错误时，应从别名、生命周期、发布/获取顺序和 helper 内联后的数据依赖入手，
+不能简单通过全局 \texttt{noinline} 或退回 O0 掩盖问题。
+
+\section{通信协议与流水线}
+
+\subsection{Ready 协议}
+
+最终配置使用独立 per-route TX-ready line，TX early publish 关闭，RX sticky mask 开启。
+sticky mask 减少重复读取已经完成的 route，但不会改变可见性协议。RX 仍然按
+round-robin 调度，确保不会因为局部热点长期阻塞其它 route。
+
+\subsection{Ping-pong 与 deferred credit}
+
+双缓冲并不意味着可以删除全局轮次发布。它解决的是相邻轮次使用不同 parity 时的
+覆盖问题，而同一 parity 再次复用前仍需要确认消费者已经释放。优化后的策略是尾部
+并行发布 release，并把 credit wait 延后到下一次同 parity 复用之前，从而减少每轮末尾
+的全局停顿，同时保持内存所有权安全。
+
+\subsection{S22 的角色划分}
+
+S22 将 64 个 AIV 划分为 42 个 Pack/Receive core 和 22 个 Send core，并使用 22 个
+QP。与 P36/S28 相比，S22 在 BS32 和 BS128 的 strict 中位数都更好，说明继续增加
+Send core 会侵占 Pack/Receive 资源，且不能稳定降低端到端关键路径。
+
+\section{最终性能结果}
+
+\begin{table}[htbp]
+\centering
+\caption{八卡 strict100 结果（max-core $\rightarrow$ max-rank $\rightarrow$ median100）}
+\begin{tabular}{lrrr}
+\toprule
+配置 & BS & 中位数/cycles & 显示值/$\mu$s \\
+\midrule
+P42/S22 & 32  & 43,130  & 43.130 \\
+P36/S28 & 32  & 46,716  & 46.716 \\
+P42/S22 & 128 & 94,889  & 94.889 \\
+P36/S28 & 128 & 115,397 & 115.397 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+S22 相对 S28 在 BS32 改善 $7.68\%$，在 BS128 改善 $17.77\%$。详细 profile 的
+代表性归因结果见表~\ref{tab:stages}。这些阶段最大值可能来自不同 core，且在时间上
+重叠，不能相加为 kernel 延迟。
+
+\begin{table}[htbp]
+\centering
+\caption{S22 代表性归因中位数}
+\label{tab:stages}
+\begin{tabular}{rrrrr}
+\toprule
+BS & Pack/$\mu$s & Receive/$\mu$s & Send/$\mu$s & Send spread/$\mu$s \\
+\midrule
+32  & 5.222  & 26.539 & 25.517 & 5.972 \\
+128 & 18.638 & 58.795 & 74.870 & 6.310 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Start Gate 的解释与展示}
+
+Start gate 用于 stream synchronize 后第一次 launch 的跨 rank 起跑协调。它不是每个
+稳态请求都重复承担的计算阶段。在 profile capture 中，executed-only 中位数分别为
+BS32 的 58.758 $\mu$s 和 BS128 的 259.991 $\mu$s。若在时间线中按比例绘制，它会把
+Pack/Receive/Send 压缩成很短的一段，降低报告可读性。
+
+交付报告采用“保留证据、折叠视图”的方法：报告头部继续展示 gate 执行次数、耗时、
+WQE 和 doorbell；默认从 phase bar 和 heatmap 移除 \texttt{start\_gate}，并把时间轴
+重定位到第一个稳态阶段。审计时可以通过 \texttt{--show-start-gate} 恢复完整视图。
+该处理只改变可视化，不修改任何 raw timing。
+
+\section{实践中的方法论收获}
+
+\begin{enumerate}
+  \item \textbf{先定义计时边界，再谈优化。} Host、strict、total-only 和 attribution
+        profile 回答的问题不同，混用会制造虚假的倍数差距。
+  \item \textbf{保留 raw cycles。} 不用 AI Core 标称频率替换系统 cycle 的显示换算，
+        避免把单位争议变成性能结论。
+  \item \textbf{分布式算子看最慢 rank。} 平均值会隐藏启动不齐、热点 route 和同步尾部。
+  \item \textbf{双缓冲不等于没有协议。} 需要区分相邻 parity 解耦与同 parity 安全复用。
+  \item \textbf{编译器是系统的一部分。} 完整保存 BiSheng command、driver 参数、source、
+        kernel 和 SO 哈希，才能复现实验。
+  \item \textbf{失败证据也要隔离保存。} 外部进程碰撞、preflight busy 和不完整 stage
+        不能混入正式统计，也不能通过覆盖目录“修复”。
+  \item \textbf{winner 与诊断指标分离。} strict 选择配置，coarse/fine 解释瓶颈；单个
+        stage 的下降不能替代双负载端到端正确性与稳定性。
+\end{enumerate}
+
+\section{仍然存在的工作}
+
+当前结果已经进入几十到约百微秒区间，但 BS128 的 Send 与 Receive 仍是主要成本。
+后续若继续优化，应优先研究 route 粒度的流水化、WQE/doorbell 组织和 polling 的实际
+等待比例，而不是再次放宽正确性协议。任何改动都应继续使用 profiling-off strict100
+作为生产判据，并保留 total-only 作为低侵入交叉验证。
+
+\appendix
+\section{交付配置摘要}
+
+\begin{longtable}{>{\ttfamily}p{0.48\textwidth}p{0.42\textwidth}}
+\toprule
+参数 & 值 \\
+\midrule
+pack/send cores & 42/22 \\
+QP / DB batch & 22/1 \\
+QDC & v3 \\
+parallel round publish & ON \\
+deferred round credit & ON \\
+RX sticky ready mask & ON \\
+TX early publish & OFF \\
+profiling (production) & OFF \\
+kernel optimization & O2 \\
+AICore / NPU arch & dav-c310-vec / dav-3510 \\
+source SHA256 & \nolinkurl{51d7c1a771f958ff656a847d264c7708653ad1563119ff7184cdf120ba55962d} \\
+kernel source SHA256 & \nolinkurl{8c59da19e23856c9a2ba8800d8cf612adedd9e9f9544d9cfbf7f04fe52ad3b47} \\
+\bottomrule
+\end{longtable}
+
+\end{document}

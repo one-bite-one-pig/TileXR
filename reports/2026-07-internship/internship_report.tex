@@ -1,0 +1,711 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage[margin=2.45cm,headheight=14pt]{geometry}
+\usepackage{amsmath}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{tikz}
+\usepackage{xcolor}
+\usepackage{xurl}
+
+\usetikzlibrary{arrows.meta,positioning,fit}
+
+\definecolor{ReportBlue}{HTML}{24527A}
+\definecolor{ReportGreen}{HTML}{34745B}
+\definecolor{ReportGold}{HTML}{A66A1F}
+\definecolor{ReportRed}{HTML}{9A3E3E}
+\definecolor{ReportGray}{HTML}{5A6470}
+\definecolor{ReportLight}{HTML}{F3F6F8}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=ReportBlue,
+  urlcolor=ReportBlue,
+  citecolor=ReportGreen,
+  pdftitle={从 AI 算力到超节点：昇腾平台上的 TileXR EP Combine 算子开发实践},
+  pdfauthor={实习月度报告}
+}
+
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.25em}
+\setlist{itemsep=0.25em,topsep=0.35em}
+\renewcommand{\arraystretch}{1.28}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{TileXR EP Combine 算子开发实践}
+\fancyhead[R]{2026 年 7 月实习报告}
+\fancyfoot[C]{\thepage}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\term}[1]{\textbf{#1}}
+\newcommand{\placeholder}[1]{\underline{\hspace{#1}}}
+
+\title{\vspace{-1.5cm}\textbf{从 AI 算力到超节点：\\[0.45em]
+昇腾平台上的 TileXR EP Combine 算子开发实践}}
+\author{
+  \begin{tabular}{rl}
+    实习生： & \placeholder{4.5cm} \\
+    学校/专业： & \placeholder{4.5cm} \\
+    实习部门： & \placeholder{4.5cm} \\
+    指导老师： & \placeholder{4.5cm}
+  \end{tabular}
+}
+\date{2026 年 7 月}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+\vfill
+
+\begin{center}
+\colorbox{ReportLight}{
+  \parbox{0.88\textwidth}{
+    \textbf{报告关键词：}AI 计算、超节点、昇腾、Ascend C、Unified Buffer、
+    MoE、专家并行、Combine、UDMA/URMA、正确性验证、性能分析
+  }
+}
+\end{center}
+
+\vfill
+\newpage
+
+\begin{abstract}
+本月实习围绕昇腾平台上的高性能通信算子开发展开。学习过程并不是从一个复杂算子的
+源代码直接开始，而是沿着“理解硬件架构、掌握 Ascend C 编程模型、认识片上数据搬运
+与卡间通信、完成真实算子实践”的路线逐步深入。最终，我在 TileXR 项目中完成了
+专家并行（Expert Parallelism，EP）场景下 Combine 算子的开发与实验，建立了从代码
+修改、独立编译、正确性验证到性能分析的完整工作流程。
+
+为便于非专业读者理解，本文首先从当前 AI 计算面临的算力、存储和通信问题出发，说明
+为什么多芯片协同和“超节点”逐渐成为大模型系统的重要基础设施；随后以通俗方式介绍
+昇腾 AI Core、Ascend C、Unified Buffer（UB）以及 UDMA/URMA 通信；最后结合
+TileXR Combine 算子，说明一个分布式 AI 算子如何把计算、数据搬运、同步协议和性能
+测量组织成可验证、可复现的工程系统。本文的重点不仅是“完成了什么”，也包括“如何
+确认它是正确的、如何判断它是否真的更快”。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{本月工作概览}
+
+本月的学习和实践可以概括为四个递进阶段，如表~\ref{tab:overview} 所示。前两个阶段
+建立对平台的认识，第三阶段把知识连接为一个完整的数据通路，第四阶段则在真实项目中
+完成闭环。四个阶段之间并不是相互独立的：没有对硬件存储层次的理解，就很难解释
+数据为什么要经过 UB；没有对同步和通信的理解，就无法保证多卡 Combine 在重复运行
+时仍然正确；没有严格的测量方法，也无法判断一次代码改动究竟带来了收益还是噪声。
+
+\begin{table}[htbp]
+  \centering
+  \caption{本月学习与实践主线}
+  \label{tab:overview}
+  \begin{tabularx}{\textwidth}{>{\bfseries}p{0.15\textwidth}X X}
+    \toprule
+    阶段 & 主要内容 & 阶段产出 \\
+    \midrule
+    平台认识 & 学习昇腾硬件架构、AI Core 和存储层次 & 能够解释 GM、UB、计算流水线之间的数据关系 \\
+    算子入门 & 学习 Ascend C 的 Host/Kernel 分工、Tiling、数据搬运与同步 & 能够阅读并修改算子代码，理解编译和运行链路 \\
+    通信学习 & 学习片上流水线同步、控制标志以及 UDMA/URMA 卡间传输 & 能够从生产者、消费者和可见性角度分析通信协议 \\
+    项目实践 & 开发 TileXR EP Combine，并开展正确性和性能实验 & 形成代码修改、独立编译、正确性验证、性能分析闭环 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+从结果上看，本月最大的收获并不只是增加了一个算子实现，而是形成了一个可重复使用的
+工程方法：先定义问题和计时边界，再修改代码；先验证正确性，再比较性能；对每次实验
+保存配置、日志和原始数据，避免只保留一个看起来更好的数字。
+
+\section{从当前 AI 计算现状说起}
+
+\subsection{AI 计算为什么越来越依赖系统能力}
+
+现代 AI 模型的能力提升通常伴随着更大的参数量、更长的上下文和更多的训练、推理数据。
+从表面上看，这是“需要更多算力”；但在真实系统中，瓶颈往往不只来自乘加运算，还来自
+以下三个方面：
+
+\begin{enumerate}
+  \item \term{容量问题：}单颗芯片的显存有限，大模型的参数、激活和中间结果无法全部容纳；
+  \item \term{带宽问题：}计算单元速度很快，如果数据不能及时到达，计算单元就会等待；
+  \item \term{协同问题：}模型分布在多颗芯片后，芯片之间需要交换数据并保持一致的执行节奏。
+\end{enumerate}
+
+可以把一颗 AI 芯片理解为一家加工能力很强的工厂。工厂中的机器再快，如果仓库取料慢、
+运输车辆堵塞，最终产量仍然受物流限制。大模型系统也是如此：计算、存储和通信必须共同
+设计，单独提高其中一项并不能保证端到端性能同步提高。
+
+\subsection{MoE：只激活一部分专家}
+
+混合专家模型（Mixture of Experts，MoE）是一种扩展模型容量的重要方法。模型中可以
+设置多个“专家”网络，但每个 token 通常只被路由到其中少数几个专家。这样，模型可以
+拥有较大的总参数规模，同时把一次计算的活跃计算量控制在合理范围内\cite{shazeer2017moe,fedus2021switch}。
+
+MoE 引入了新的系统问题：专家可能分布在不同芯片上，因此 token 要先被发送到对应专家，
+专家计算完成后再把结果送回原位置。前一个过程通常称为 \term{Dispatch}，后一个过程称为
+\term{Combine}。当模型规模扩大到多卡甚至多机时，这两个步骤会形成密集的多对多通信，
+通信效率便直接影响模型整体效率。
+
+\subsection{为什么会引出超节点}
+
+传统集群通过网络连接多台服务器，扩展灵活，但跨设备通信的带宽和时延与芯片内部差距
+很大。为了让多颗加速芯片更像一个整体，业界开始构建更紧密的计算单元：在一个受控范围
+内提供高带宽、低时延互连，并配合统一的通信软件和任务调度。这类系统通常被称为
+\term{超节点}。
+
+超节点不是简单地“把更多卡装在一起”。它强调的是计算、内存、互连和软件栈的协同：
+
+\begin{itemize}
+  \item 对应用而言，多颗芯片应能高效协作，而不是彼此孤立；
+  \item 对通信而言，要减少不必要的数据复制和 Host 介入；
+  \item 对算子而言，要把计算、搬运和同步重叠起来，减少等待；
+  \item 对工程而言，要能定位最慢的芯片、最慢的通信路径和最慢的流水线阶段。
+\end{itemize}
+
+因此，从 AI 计算现状到超节点，再到本月的 Combine 实践，逻辑关系可以概括为：
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+    node distance=0.7cm,
+    box/.style={draw,rounded corners=2pt,minimum height=1.05cm,text width=3.1cm,
+      align=center,fill=ReportLight},
+    arrow/.style={-{Latex[length=2.4mm]},thick,draw=ReportBlue}
+  ]
+    \node[box] (model) {模型规模与数据量增长};
+    \node[box,right=of model] (multi) {单芯片容量与带宽受限};
+    \node[box,right=of multi] (super) {多芯片紧密协同\\超节点};
+    \node[box,right=of super] (op) {通信计算融合\\Combine 算子};
+    \draw[arrow] (model) -- (multi);
+    \draw[arrow] (multi) -- (super);
+    \draw[arrow] (super) -- (op);
+  \end{tikzpicture}
+  \caption{从 AI 计算需求到 Combine 算子实践的逻辑链条}
+  \label{fig:motivation}
+\end{figure}
+
+\section{昇腾架构与 Ascend C 算子开发}
+
+\subsection{从“计算芯片”到“数据通路”}
+
+昇腾 NPU 面向 AI 计算提供专用计算核心。对本次实习最重要的认识是：开发算子时不能只
+关注公式，还要关注数据位于哪里、由谁搬运、何时可见。一个简化的数据层次如下：
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+    level/.style={draw,minimum height=1.0cm,align=center,rounded corners=2pt},
+    arrow/.style={<->,>=Latex,thick,draw=ReportGray}
+  ]
+    \node[level,fill=ReportLight,text width=3.2cm] (gm) {Global Memory（GM）\\容量较大，访问较慢};
+    \node[level,fill=ReportLight,text width=3.2cm,right=1.1cm of gm] (ub) {Unified Buffer（UB）\\片上暂存，容量较小};
+    \node[level,fill=ReportLight,text width=3.2cm,right=1.1cm of ub] (calc) {Vector/Scalar 等流水线\\执行计算与控制};
+    \draw[arrow] (gm) -- node[above]{MTE 搬运} (ub);
+    \draw[arrow] (ub) -- node[above]{读写数据} (calc);
+  \end{tikzpicture}
+  \caption{面向算子开发的简化数据通路}
+  \label{fig:memory}
+\end{figure}
+
+其中，GM 可以类比为工厂的大仓库，UB 可以类比为生产线旁边的小料架。大仓库容量大，
+但每次取料成本较高；小料架离计算单元近，但容量有限。高性能算子需要把数据分块搬入
+UB，在计算的同时准备下一块数据，并在合适时机把结果写回 GM。
+
+这里需要特别澄清：\term{UB（Unified Buffer）本身是片上缓冲存储，并不是网络通信
+协议}。本月学习的“UB 相关通信”更准确地说，是围绕 GM 与 UB 的数据搬运、不同流水线
+之间的事件同步，以及在此基础上延伸出的设备间通信与可见性协议。
+
+\subsection{Ascend C 的编程视角}
+
+Ascend C 为算子开发提供接近 C++ 的编程方式，同时暴露 AI Core 的数据搬运和计算能力。
+一个完整算子通常包含两类工作：
+
+\begin{itemize}
+  \item \term{Host 侧：}检查输入、计算 Tiling 参数、准备 Workspace、选择 Kernel 配置并发起执行；
+  \item \term{Kernel 侧：}在 AI Core 上完成数据搬运、向量计算、核间同步和结果写回。
+\end{itemize}
+
+本月在阅读和修改代码时，我逐步理解了
+\code{DataCopy}/\code{DataCopyPad}、\code{Cast}、向量计算、事件标志、流水线屏障和双缓冲
+等概念。与普通 CPU 程序相比，算子开发更强调显式的数据布局和执行顺序。例如，数据从
+GM 搬到 UB 后，必须等待对应搬运事件完成，后续 Scalar 或 Vector 流水线才能安全读取；
+输出写回 GM 前，也必须保证向量计算已经结束。
+
+\subsection{流水线与双缓冲}
+
+如果每一轮都严格按照“搬入、等待、计算、等待、搬出”的顺序串行执行，硬件中会出现
+大量空闲时间。双缓冲的思路是准备两块 UB 空间：计算第 0 块数据时，可以同时搬运第 1 块；
+下一轮交换两块空间的角色。其目标不是减少计算量，而是把搬运时间隐藏在计算时间中。
+
+不过，双缓冲也带来了新的正确性要求：一块缓冲区只有在上一位消费者完全使用结束后
+才能复用。因此，“并行得更多”必须与“同步得正确”同时满足，这一认识后来直接应用到
+Combine 的发送、接收和窗口复用设计中。
+
+\section{从片上同步到卡间通信}
+
+\subsection{通信不仅是把数据从 A 复制到 B}
+
+在单线程程序中，写完数据再读取通常是自然发生的；在多核、多卡环境中，生产者和消费者
+可能独立运行。一个完整的通信过程至少要回答四个问题：
+
+\begin{enumerate}
+  \item 数据写到了什么地址；
+  \item 消费者如何知道数据已经写完；
+  \item “看到完成标志”是否意味着也能看到完整数据；
+  \item 这块内存何时可以被下一轮安全复用。
+\end{enumerate}
+
+这也是为什么 Combine 不能只调用一次复制接口。数据传输之外，还需要 Ready 标志、
+内存屏障、完成确认和轮次编号共同构成通信协议。
+
+\subsection{UDMA/URMA 的作用}
+
+TileXR 在目标平台上使用 UDMA/URMA 能力，让设备侧能够针对已注册的远端内存直接提交
+数据传输。可以把它理解为：AI Core 不必把数据先交回 CPU，再由 CPU 转发，而是能够
+准备传输描述、敲响 doorbell，并等待队列完成。这样既减少 Host 参与，也为计算与通信
+重叠提供了条件。
+
+非阻塞提交只表示“传输任务已经交给硬件”，并不等于“远端已经收到完整数据”。因此，
+实现中还要通过完成队列和 Quiet 等机制确认传输完成，再发布本轮结束状态。这个区别是
+本月理解设备通信语义的重要一步。
+
+\subsection{三层 Ready 协议}
+
+Combine 实践中使用的同步可以用三层关系解释：
+
+\begin{longtable}{>{\bfseries}p{0.18\textwidth}p{0.27\textwidth}p{0.46\textwidth}}
+  \caption{Combine 中三类 Ready/控制机制}\label{tab:ready}\\
+  \toprule
+  机制 & 连接的角色 & 解决的问题 \\
+  \midrule
+  \endfirsthead
+  \toprule
+  机制 & 连接的角色 & 解决的问题 \\
+  \midrule
+  \endhead
+  TxReady & 本地 Pack 与本地 Send & Pack 完整写好一条待发送数据后，Send 才能读取并提交传输 \\
+  DataAsFlag & 远端 Send/UDMA 与 Receive & Receive 看到数据块尾部标志后，才读取对应 payload \\
+  Control Line & 多核与多 rank & 协调启动、发送完成、接收完成和窗口释放等全局状态 \\
+  \bottomrule
+\end{longtable}
+
+每个控制值都带有当前轮次的 generation（在实现中由 \code{magic} 表示）。这样，即使内存
+中还保留着上一轮的标志，新一轮也不会把旧状态误认为当前状态。这个设计体现了通信协议
+的核心：标志不仅要表示“完成”，还必须说明“是哪一轮的完成”。
+
+\section{TileXR EP Combine 算子实践}
+
+\subsection{Combine 要完成什么工作}
+
+在专家并行的 MoE 模型中，Dispatch 根据路由结果把 token 发往不同专家所在的 rank。
+专家计算后，每个原始 token 会得到若干个专家输出。Combine 的任务是把这些输出送回
+token 所属的 rank，按权重还原并累加：
+
+\begin{equation}
+  y_{t}=\sum_{k=1}^{K} w_{t,k}\cdot
+  \operatorname{dequant}\!\left(e_{t,k}\right),
+\end{equation}
+
+其中 $t$ 表示 token，$K$ 表示被选中的专家数量，$e_{t,k}$ 是第 $k$ 个专家输出，
+$w_{t,k}$ 是对应的路由权重。公式本身并不复杂，困难在于这些专家输出可能来自不同 rank，
+到达时间也不完全一致。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+    node distance=0.65cm,
+    box/.style={draw,rounded corners=2pt,minimum height=0.95cm,text width=2.3cm,
+      align=center,fill=ReportLight},
+    arrow/.style={-{Latex[length=2.3mm]},thick,draw=ReportBlue}
+  ]
+    \node[box] (token) {原始 token};
+    \node[box,right=of token] (dispatch) {Dispatch\\发送到专家};
+    \node[box,right=of dispatch] (expert) {多 rank\\专家计算};
+    \node[box,right=of expert] (combine) {Combine\\回传与加权};
+    \node[box,right=of combine] (output) {最终 token 输出};
+    \draw[arrow] (token) -- (dispatch);
+    \draw[arrow] (dispatch) -- (expert);
+    \draw[arrow] (expert) -- (combine);
+    \draw[arrow] (combine) -- (output);
+  \end{tikzpicture}
+  \caption{MoE 中 Dispatch、专家计算与 Combine 的关系}
+  \label{fig:moe}
+\end{figure}
+
+\subsection{算子的主要数据流}
+
+本次实现把 64 个逻辑 AIV 分成 Pack/Receive 和 Send 两类角色。前者负责将专家结果量化
+打包，并在远端数据到达后完成反量化、TopK 加权累加和输出；后者负责扫描本地已就绪的
+route，提交 UDMA 传输并参与轮次控制。最终交付配置采用 42 个 Pack/Receive 核与 22 个
+Send 核。这个划分不是理论上预先确定的常数，而是通过不同配置的双负载实验比较得到。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+    node distance=0.55cm,
+    stage/.style={draw,rounded corners=2pt,minimum height=1.0cm,text width=2.15cm,
+      align=center,fill=ReportLight},
+    signal/.style={draw,dashed,rounded corners=2pt,minimum height=0.75cm,text width=1.9cm,
+      align=center,fill=white},
+    arrow/.style={-{Latex[length=2.2mm]},thick,draw=ReportBlue},
+    ctrl/.style={-{Latex[length=2.0mm]},dashed,draw=ReportGold}
+  ]
+    \node[stage] (pack) {Pack\\量化与打包};
+    \node[signal,right=of pack] (tx) {TxReady};
+    \node[stage,right=of tx] (send) {Send\\UDMA 提交};
+    \node[signal,right=of send] (flag) {DataAsFlag};
+    \node[stage,right=of flag] (recv) {Receive\\反量化与累加};
+    \draw[arrow] (pack) -- (tx);
+    \draw[arrow] (tx) -- (send);
+    \draw[arrow] (send) -- (flag);
+    \draw[arrow] (flag) -- (recv);
+    \node[signal,below=0.85cm of send] (round) {Round Control};
+    \draw[ctrl] (send) -- (round);
+    \draw[ctrl] (recv) -- (round);
+  \end{tikzpicture}
+  \caption{Combine 的主要数据与控制路径}
+  \label{fig:combine-flow}
+\end{figure}
+
+这个数据流包含以下关键步骤：
+
+\begin{enumerate}
+  \item \term{Pack：}读取专家输出，按 route 量化并组织为适合通信的连续数据块；
+  \item \term{本地发布：}数据完整写回后发布 TxReady，通知 Send 核可以消费；
+  \item \term{Send：}读取 metadata，区分本地复制和远端发送，向 UDMA 队列提交任务；
+  \item \term{Receive：}轮询远端数据块的 DataAsFlag，确认就绪后搬入 UB；
+  \item \term{恢复与聚合：}反量化专家输出，乘以 TopK 权重，并使用 FP32 累加；
+  \item \term{轮次收尾：}确认发送、接收和输出全部完成，再发布窗口可复用状态。
+\end{enumerate}
+
+\subsection{实现中的重点问题}
+
+\subsubsection{正确的数据可见性顺序}
+
+实现必须保证“先有数据，后有标志”。如果生产者提前发布 Ready，消费者可能读到尚未写完
+的数据。反过来，消费者看到 Ready 后也要建立 acquire 顺序，再开始读取 payload。本次
+实践将这类要求整理为清晰的不变量，例如：
+
+\begin{center}
+  \fbox{\parbox{0.9\textwidth}{
+    TxData 完整可见 $\rightarrow$ TxReady 可见 $\rightarrow$ Send 读取；\\
+    Rx payload 完整可见 $\rightarrow$ DataAsFlag 可见 $\rightarrow$ Receive 读取；\\
+    全部发送完成且全部接收完成 $\rightarrow$ 发布 RxWindow 可复用。
+  }}
+\end{center}
+
+\subsubsection{Ping-pong 窗口的安全复用}
+
+接收区使用两个窗口按轮次奇偶交替，从而避免相邻轮次立即覆盖同一批地址。但两个窗口
+并不意味着可以取消同步：当同一窗口在两轮之后再次被使用时，仍要确认上一位消费者已经
+完成并清理标志。这个问题让我认识到，缓冲区数量和内存所有权协议是两个不同维度。
+
+\subsubsection{核角色与负载平衡}
+
+增加 Send 核可以提高同时提交传输的能力，但也会减少执行 Pack/Receive 的核心数量；
+反之，Pack/Receive 核过多又可能使发送侧成为瓶颈。因此需要把核角色比例视为端到端配置，
+而不是孤立优化某一阶段。最终使用不同 batch size 共同选择配置，避免只对单一负载过拟合。
+
+\section{建立完整的实验流程}
+
+\subsection{代码修改：先明确改动假设}
+
+每次修改前先写清楚它希望解决的具体问题，例如“减少重复 Ready 读取”“提前发布某个状态”
+或“调整 Pack/Send 核比例”。一个改动尽量只对应一个主要假设，便于通过 A/B 实验判断效果。
+如果一次同时改变多个条件，即使结果变快，也很难知道真正有效的是哪一项。
+
+代码层面同时关注 Host 与 Kernel：Host 侧负责参数、Workspace 布局和启动配置，Kernel 侧
+负责设备上的数据路径。两边对偏移、大小和角色划分的理解必须一致，否则错误可能表现为
+越界、数据错位，甚至多卡等待无法结束。
+
+\subsection{独立编译：确认测试的就是当前代码}
+
+编译并不只是把源代码变成二进制，还决定了内联、指令布局和优化级别。实践中显式检查
+BiSheng 编译命令和 driver 展开的参数，并分别比较不同优化级别。最终交付选择 O2：它保留
+主要性能收益，同时通过正确性和双负载性能验证。
+
+为了避免“修改了源代码但运行的仍是旧产物”，实验记录中保存源码、Kernel 和动态库的
+哈希，并将构建配置与运行结果放在同一个可追溯目录中。这使编译产物成为实验的一部分，
+而不是被忽略的中间文件。
+
+\subsection{正确性验证：不仅比较一次输出}
+
+分布式算子容易出现只在特定轮次、特定 rank 或特定输入规模触发的问题。因此正确性验证
+不能只做一次数值比较，而应覆盖表~\ref{tab:correctness} 中的多个维度。
+
+\begin{table}[htbp]
+  \centering
+  \caption{Combine 正确性验证维度}
+  \label{tab:correctness}
+  \begin{tabularx}{\textwidth}{>{\bfseries}p{0.23\textwidth}X}
+    \toprule
+    验证维度 & 目的 \\
+    \midrule
+    参考结果对比 & 确认量化、反量化、TopK 加权和输出位置正确 \\
+    多 batch size & 检查边界、分块和不同 token 分配是否正确 \\
+    多 rank 联合运行 & 检查远端寻址、路由信息和全局同步 \\
+    多轮重复运行 & 检查 generation、Ping-pong 窗口和旧标志残留 \\
+    非法 metadata/header & 检查错误能被记录，同时协议可以安全收尾 \\
+    优化级别切换 & 暴露可能被低优化级别掩盖的生命周期或别名问题 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+正确性优先于性能。如果一个方案只能通过放松同步或减少必要检查来获得更低时间，它并不
+构成可接受的优化。性能实验只在正确性 smoke test 通过后进入正式统计。
+
+\subsection{性能分析：先定义“时间”是什么}
+
+性能分析中最容易犯的错误，是把不同边界测得的时间直接比较。本次实践区分了三类指标：
+
+\begin{itemize}
+  \item \term{Host 时间：}包含发起、调度以及可能的同步开销，适合观察应用侧体验；
+  \item \term{Strict Kernel 时间：}尽量少插桩，表示生产 Kernel 的关键路径；
+  \item \term{分阶段 Profile：}记录 Pack、Send、Receive 和等待阶段，用于解释瓶颈，但插桩本身可能改变性能。
+\end{itemize}
+
+正式配置选择使用 profiling-off 的 Strict Kernel 指标。聚合顺序为：每个 rank 内取 64 个
+AIV 的最大值，每次 launch 再取所有 rank 的最大值，最后对多次有效 launch 取中位数。
+这样统计的是整个分布式请求的关键路径，因为最终完成时间由最慢的 core 和最慢的 rank
+决定，而不是由平均值决定。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+    node distance=0.7cm,
+    box/.style={draw,rounded corners=2pt,minimum height=0.95cm,text width=3.0cm,
+      align=center,fill=ReportLight},
+    arrow/.style={-{Latex[length=2.3mm]},thick,draw=ReportGreen}
+  ]
+    \node[box] (change) {提出假设并修改代码};
+    \node[box,right=of change] (build) {独立编译并记录产物};
+    \node[box,right=of build] (correct) {正确性与多轮验证};
+    \node[box,below=0.8cm of correct] (profile) {Strict 测量与阶段归因};
+    \node[box,left=of profile] (compare) {A/B 对比与结果复核};
+    \node[box,left=of compare] (archive) {保存配置、日志与原始数据};
+    \draw[arrow] (change) -- (build);
+    \draw[arrow] (build) -- (correct);
+    \draw[arrow] (correct) -- (profile);
+    \draw[arrow] (profile) -- (compare);
+    \draw[arrow] (compare) -- (archive);
+    \draw[arrow] (archive) -- (change);
+  \end{tikzpicture}
+  \caption{本月建立的算子实验闭环}
+  \label{fig:workflow}
+\end{figure}
+
+\section{实验结果与分析}
+
+\subsection{固定环境下的代表性结果}
+
+表~\ref{tab:performance} 给出项目交付记录中的代表性结果。测试固定在八卡、隐藏维度
+$H=5120$、TopK$=6$ 的负载上，并同时比较 BS32 和 BS128。表中时间保留 raw cycles，
+显示微秒值沿用项目测量约定。这里的数字用于比较同一环境下的配置，不用于推导不同硬件
+或不同模型上的绝对结论。
+
+\begin{table}[htbp]
+  \centering
+  \caption{八卡 Strict Kernel 代表性结果（100 次有效 launch 的中位数）}
+  \label{tab:performance}
+  \begin{tabular}{lrrr}
+    \toprule
+    核角色配置 & Batch Size & 中位数/cycles & 显示值/$\mu$s \\
+    \midrule
+    P42/S22 & 32  & 43,130  & 43.130 \\
+    P36/S28 & 32  & 46,716  & 46.716 \\
+    P42/S22 & 128 & 94,889  & 94.889 \\
+    P36/S28 & 128 & 115,397 & 115.397 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+其中 P 表示 Pack/Receive 核数量，S 表示 Send 核数量。P42/S22 相对 P36/S28 在 BS32
+上改善约 $7.68\%$，在 BS128 上改善约 $17.77\%$。结果说明：继续增加 Send 核并没有
+稳定降低端到端时间，反而会侵占 Pack/Receive 资源。较大的 BS128 对这种资源失衡更敏感，
+因此双负载共同选择比只看 BS32 更可靠。
+
+\subsection{如何避免“测得越详细，看起来越慢”}
+
+早期分阶段 Profile 在很多位置记录时间和计数，插桩会增加指令、同步和分支，并改变代码
+布局，因此测得的绝对时间明显高于生产 Kernel。为验证这一点，实践中增加了低侵入的
+total-only 测量，只记录总时间，并使用与 Strict 相同的边界。在一个代表性配置上，
+matched strict10 为 41,703.5 cycles，total-only10 为 41,126 cycles，差异约为
+$-1.38\%$。这说明旧 Profile 的大幅膨胀主要来自观测方式，而不是生产 Kernel 的真实成本。
+
+由此形成了明确分工：Strict 用于选择最终配置，分阶段 Profile 用于解释时间花在哪里。
+某个阶段单独变快，只能作为线索，不能替代端到端结果和正确性验证。
+
+\subsection{未采用方案同样有价值}
+
+研发过程中也尝试了提前发布 TxReady、批量 Ready 读取、Vector 比较、不同核比例以及不同
+编译优化级别等方向。部分方案在某个 batch size 或某个局部阶段上有收益，但没有通过
+双负载、重复运行或综合稳定性验证，因此没有进入最终配置。
+
+这些“未采用”结果不是无效工作。它们帮助缩小了瓶颈范围，也证明性能优化不能依赖单次
+最好值。保留失败配置和原始记录，使后续开发者能够知道哪些方向已经验证过、为什么没有
+合入，避免重复试错。
+
+\section{本月遇到的主要困难与解决方法}
+
+\begin{longtable}{>{\bfseries}p{0.22\textwidth}p{0.34\textwidth}p{0.34\textwidth}}
+  \caption{主要困难、分析方法与收获}\label{tab:challenges}\\
+  \toprule
+  困难 & 处理方法 & 形成的认识 \\
+  \midrule
+  \endfirsthead
+  \toprule
+  困难 & 处理方法 & 形成的认识 \\
+  \midrule
+  \endhead
+  概念跨度大 & 从存储层次和最小数据通路入手，再阅读完整 Kernel & 先建立系统地图，再进入局部代码效率更高 \\
+  多核多卡错误难复现 & 使用 generation、重复轮次、错误状态和超时信息定位 & 分布式正确性依赖明确的状态机，而不仅是数值输出 \\
+  Profile 与 Strict 差距大 & 对齐计时边界，增加 total-only 交叉验证 & 测量工具会影响被测对象，必须控制观测开销 \\
+  局部优化未带来总收益 & 同时观察最慢 core、最慢 rank 和双负载结果 & 端到端性能由关键路径决定，不等于局部阶段之和 \\
+  编译配置影响结果 & 保存实际编译命令、优化级别与产物哈希 & 编译器和代码生成也是系统设计的一部分 \\
+  实验数量多、容易混淆 & 为每个 variant 固化配置并隔离结果目录 & 可追溯性是性能结论可信度的基础 \\
+  \bottomrule
+\end{longtable}
+
+其中最重要的转变，是从“看代码是否合理”转向“用证据确认系统行为”。例如，一个 Ready
+标志从代码顺序上看似乎写在数据之后，但仍要结合流水线事件和内存屏障判断硬件可见性；
+一个优化从局部计时看更快，也仍要用端到端 Strict 指标确认其是否缩短关键路径。
+
+\section{阶段总结与能力提升}
+
+\subsection{技术能力}
+
+经过本月实践，我对昇腾算子开发形成了从硬件到应用的分层认识：
+
+\begin{itemize}
+  \item 能够从 GM、UB 和执行流水线角度分析数据路径；
+  \item 能够区分 Host 侧配置与 Kernel 侧执行职责；
+  \item 能够理解多核生产者--消费者同步、卡间传输和窗口复用；
+  \item 能够阅读 EP Combine 的 Pack、Send、Receive 和控制流程；
+  \item 能够针对真实改动完成编译、正确性验证、性能采集和结果解释。
+\end{itemize}
+
+\subsection{工程能力}
+
+相比具体 API，本月更具长期价值的是工程习惯的建立：
+
+\begin{enumerate}
+  \item \term{问题可拆分：}把复杂算子拆成数据布局、计算、通信、同步和测量五类问题；
+  \item \term{实验可复现：}固定代码、编译参数、运行参数和统计口径；
+  \item \term{结论可审计：}保留 raw cycles、逐 rank 结果和失败实验，不只报告最好数字；
+  \item \term{优化有边界：}任何性能收益都不能以破坏协议和正确性为代价；
+  \item \term{表达面向读者：}先解释问题为什么存在，再介绍实现如何解决，而不是直接堆叠代码细节。
+\end{enumerate}
+
+\subsection{本月进度回顾}
+
+\begin{table}[htbp]
+  \centering
+  \caption{按周回顾}
+  \begin{tabularx}{\textwidth}{>{\bfseries}p{0.13\textwidth}X X}
+    \toprule
+    时间 & 学习/实践重点 & 结果 \\
+    \midrule
+    第一周 & 昇腾架构、AI Core、GM/UB 与基础 Ascend C & 建立算子执行和数据搬运的基本认识 \\
+    第二周 & Ascend C 算子结构、流水线同步、双缓冲和编译流程 & 能够独立阅读、修改并编译算子代码 \\
+    第三周 & UDMA/URMA、Ready 协议、Workspace 与多 rank 同步 & 理解 Combine 的跨核、跨卡数据通路 \\
+    第四周 & Combine 开发、正确性验证、性能 Profile 与 A/B 对比 & 完成算子实践并形成完整实验闭环 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\section{后续计划}
+
+下一阶段计划从“完成一个算子”继续走向“能够稳定地优化和维护算子”：
+
+\begin{enumerate}
+  \item 继续补充 Ascend C 指令、内存对齐和流水线调度知识，减少对经验性试验的依赖；
+  \item 深入分析 BS128 下 Send 与 Receive 的关键路径，研究 route 粒度流水化和轮询等待比例；
+  \item 完善自动化正确性回归，覆盖更多 shape、rank 数和长时间重复运行；
+  \item 将实验记录模板化，使源码、编译参数、运行配置和报告可以自动关联；
+  \item 学习 Dispatch 与专家计算侧实现，从单个 Combine 算子扩展到完整 MoE 数据通路。
+\end{enumerate}
+
+后续优化仍将遵循本月建立的原则：先保证协议正确，再讨论性能；先统一测量边界，再比较
+数字；既关注局部阶段，也始终回到多 rank 端到端关键路径。
+
+\section{结语}
+
+本月实习从昇腾架构和 Ascend C 入门，逐步进入片上数据搬运、流水线同步和设备间通信，
+最终在 TileXR EP Combine 算子上完成了综合实践。这个过程让我认识到，高性能 AI 算子
+并不是一段孤立的数学计算代码，而是硬件存储层次、编译器、通信队列、同步协议和实验
+方法共同组成的系统。
+
+从 AI 计算到超节点，核心问题始终是如何让更多计算单元高效、正确地协同工作；从超节点
+落到 Combine，工程任务则变成了每一块数据如何被打包、何时发送、如何确认到达、何时
+可以复用。通过本月实践，我已经建立起处理这类问题的基本框架，并能够以可验证、可复现
+的方式推进后续工作。
+
+\appendix
+
+\section{术语速查}
+
+\begin{longtable}{>{\bfseries}p{0.18\textwidth}p{0.72\textwidth}}
+  \toprule
+  术语 & 通俗解释 \\
+  \midrule
+  AI Core & 昇腾芯片中执行 AI 计算和数据搬运的核心单元 \\
+  Ascend C & 面向昇腾 AI Core 的算子编程语言与开发方式 \\
+  GM & 容量较大的全局存储，可类比为工厂的大仓库 \\
+  UB & AI Core 内的 Unified Buffer，可类比为生产线旁的小料架 \\
+  MTE & 负责不同存储层次之间数据搬运的硬件流水线 \\
+  MoE & 混合专家模型，每个 token 只选择少数专家参与计算 \\
+  EP & 专家并行，把不同专家分布在不同设备上 \\
+  Dispatch & 把 token 发送到被选中专家的过程 \\
+  Combine & 把专家结果送回并按权重聚合的过程 \\
+  rank & 分布式任务中的一个参与者，在本报告中通常对应一张卡上的进程 \\
+  route & 一条专家输出及其目标 token、目标 rank 等路由信息 \\
+  UDMA/URMA & 面向注册内存的设备间直接数据传输能力 \\
+  Ready flag & 生产者通知消费者“某一轮数据已经可以使用”的状态标志 \\
+  Ping-pong & 两块缓冲区交替使用，以重叠相邻轮次或避免立即覆盖 \\
+  Profile & 通过插桩记录各阶段时间和计数，用于定位性能瓶颈 \\
+  Strict time & 尽量减少插桩后测得的 Kernel 关键路径时间 \\
+  \bottomrule
+\end{longtable}
+
+\section{实验复现检查清单}
+
+\begin{enumerate}
+  \item 记录源码版本、关键文件哈希和本次 variant 名称；
+  \item 记录 CANN、驱动、目标芯片和实际 BiSheng 编译参数；
+  \item 记录 rank 数、batch size、hidden size、TopK 和核角色配置；
+  \item 编译完成后确认运行加载的是本次生成的 Kernel 和动态库；
+  \item 先执行正确性 smoke test，再执行多轮和多 rank 验证；
+  \item 性能测试隔离其他任务，记录无效样本和异常原因；
+  \item 使用 max-core、max-rank、median-launch 的统一聚合口径；
+  \item 同时保留 raw cycles、汇总表、逐 rank 数据和阶段 Profile；
+  \item 最终 winner 必须通过双负载验证，不能只依赖单次最好值；
+  \item 将未采用方案及原因一并归档，保证结论可以审计。
+\end{enumerate}
+
+\begin{thebibliography}{9}
+  \bibitem{shazeer2017moe}
+  Noam Shazeer et al.
+  \newblock Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer.
+  \newblock \emph{International Conference on Learning Representations}, 2017.
+
+  \bibitem{fedus2021switch}
+  William Fedus, Barret Zoph, Noam Shazeer.
+  \newblock Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity.
+  \newblock \emph{Journal of Machine Learning Research}, 2022.
+
+  \bibitem{ascenddocs}
+  华为昇腾社区.
+  \newblock Ascend C 算子开发与 CANN 文档中心.
+  \newblock \url{https://www.hiascend.com/document}.
+
+  \bibitem{tilexrdesign}
+  TileXR 项目.
+  \newblock EP URMA Combine 设计说明、测试脚本与性能交付记录，2026.
+\end{thebibliography}
+
+\end{document}
